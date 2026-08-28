@@ -53,3 +53,5 @@ tmp/
 .temp/
 .gui_verify*.png
 PromptBox.lnk
+*.bat.bak
+推送到GitHub.bat
