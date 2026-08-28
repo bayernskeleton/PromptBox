@@ -1,0 +1,56 @@
+{
+  "version": 3,
+  "categories": [
+    {
+      "id": "cat_writing",
+      "name": "写作辅助",
+      "parent_id": null,
+      "children": ["cat_writing_inspect"]
+    },
+    {
+      "id": "cat_writing_inspect",
+      "name": "文字质检",
+      "parent_id": "cat_writing",
+      "children": []
+    },
+    {
+      "id": "cat_inbox",
+      "name": "未分类",
+      "parent_id": null,
+      "children": []
+    }
+  ],
+  "tags": [
+    { "id": "tag_writing", "name": "写作" },
+    { "id": "tag_inspect", "name": "质检" }
+  ],
+  "snippets": [
+    {
+      "id": "snip_example_polish",
+      "title": "示例：文字润色",
+      "category_id": "cat_writing",
+      "tag_ids": ["tag_writing"],
+      "created_at": "2026-01-01T00:00:00.000000",
+      "updated_at": "2026-01-01T00:00:00.000000",
+      "source_prompt_id": null,
+      "source_version_id": null,
+      "scenario": "把一段文字改得更通顺",
+      "_deleted": false,
+      "versions": [
+        {
+          "id": "ver_example_1",
+          "version_number": 1,
+          "content": "请润色下面这段文字：{原文}。保持原意，让句子更通顺自然，不要改变作者的观点和语气。",
+          "changelog": "初始版本",
+          "status": "stable",
+          "created_at": "2026-01-01T00:00:00.000000",
+          "parent_version_id": null
+        }
+      ],
+      "current_version_id": "ver_example_1",
+      "stable_version_id": "ver_example_1",
+      "content": ""
+    }
+  ],
+  "runs": []
+}
