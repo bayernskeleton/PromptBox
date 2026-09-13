@@ -81,6 +81,91 @@ def _load_promptbox_module():
     return module
 
 
+def _branch_snippet(promptbox, sid, title, category_id="cat_1", content="原内容"):
+    return {
+        "id": sid,
+        "title": title,
+        "category_id": category_id,
+        "tag_ids": [],
+        "current_version_id": f"{sid}_v1",
+        "stable_version_id": None,
+        "_deleted": False,
+        "versions": [{
+            "id": f"{sid}_v1", "version_number": 1, "content": content,
+            "status": promptbox.VER_DRAFT,
+        }],
+    }
+
+
+def test_branch_writeback_handles_merge_and_records_sources(tmp_path):
+    promptbox = _load_promptbox_module()
+    app = object.__new__(promptbox.PromptBox)
+    app.snippets = [
+        _branch_snippet(promptbox, "s1", "入口"),
+        _branch_snippet(promptbox, "s2", "回退"),
+    ]
+    app.data = {"snippets": app.snippets, "repair_cases": [], "categories": [
+        {"id": "cat_1", "name": "主类", "parent_id": None, "children": []},
+    ]}
+    app._save_data = lambda: None
+    workbench = types.SimpleNamespace(
+        ui_branch_payload={"is_branch": True, "items": [
+            {"id": "s1", "title": "入口", "category_path": ["主类"], "content": "入口新", "source_ids": ["s1"], "change_type": "modified", "change_reason": "补边界"},
+            {"id": "s2", "title": "回退", "category_path": ["主类"], "content": "回退原", "source_ids": ["s2"], "change_type": "unchanged", "change_reason": "保留"},
+        ]},
+        build_adopted_branch=lambda: {"is_branch": True, "items": [
+            {"id": "m1", "title": "合并入口与回退", "category_path": ["主类"], "content": "合并后", "source_ids": ["s1", "s2"], "change_type": "merged", "change_reason": "合并职责"},
+        ]},
+    )
+    case = {"id": "case_merge"}
+    result = app._adopt_verified_branch(workbench, case)
+    assert result == ["s1"]
+    assert app.snippets[0]["versions"][-1]["content"] == "合并后"
+    assert app.snippets[0]["versions"][-1]["repair_case_id"] == "case_merge"
+    assert app.snippets[1]["_deleted"] is True
+
+
+def test_branch_writeback_maps_category_path_and_splits_source(tmp_path):
+    promptbox = _load_promptbox_module()
+    app = object.__new__(promptbox.PromptBox)
+    app.snippets = [_branch_snippet(promptbox, "s1", "原 Prompt", category_id="cat_1")]
+    app.data = {"snippets": app.snippets, "repair_cases": [], "categories": [
+        {"id": "cat_1", "name": "主类", "parent_id": None, "children": []},
+        {"id": "cat_2", "name": "子类", "parent_id": "cat_1", "children": []},
+    ]}
+    app._save_data = lambda: None
+    workbench = types.SimpleNamespace(
+        ui_branch_payload={"is_branch": True, "items": [
+            {"id": "s1", "title": "原 Prompt", "category_path": ["主类"], "content": "原内容", "source_ids": ["s1"], "change_type": "split", "change_reason": "拆分职责"},
+        ]},
+        build_adopted_branch=lambda: {"is_branch": True, "items": [
+            {"id": "c1", "title": "入口", "category_path": ["主类", "子类"], "content": "入口内容", "source_ids": ["s1"], "change_type": "split", "change_reason": "拆分职责"},
+            {"id": "c2", "title": "回退", "category_path": ["主类", "子类"], "content": "回退内容", "source_ids": ["s1"], "change_type": "split", "change_reason": "拆分职责"},
+        ]},
+    )
+    result = app._adopt_verified_branch(workbench, {"id": "case_split"})
+    assert len(result) == 2
+    assert app.snippets[0]["category_id"] == "cat_2"
+    assert app.snippets[0]["title"] == "入口"
+    assert app.snippets[1]["title"] == "回退"
+    assert all(snippet["category_id"] == "cat_2" for snippet in app.snippets)
+
+
+def test_branch_writeback_does_not_delete_rejected_source():
+    promptbox = _load_promptbox_module()
+    app = object.__new__(promptbox.PromptBox)
+    app.snippets = [_branch_snippet(promptbox, "s1", "原 Prompt")]
+    app.data = {"snippets": app.snippets, "repair_cases": [], "categories": []}
+    app._save_data = lambda: None
+    workbench = types.SimpleNamespace(
+        ui_branch_payload={"is_branch": True, "items": [{"id": "s1", "title": "原 Prompt", "content": "原内容"}]},
+        build_adopted_branch=lambda: {"is_branch": False, "items": []},
+    )
+    with pytest.raises(ValueError, match="可写回"):
+        app._adopt_verified_branch(workbench, {"id": "case_reject"})
+    assert app.snippets[0]["_deleted"] is False
+
+
 def test_validated_version_exposes_evidence_action_only_when_record_exists():
     promptbox = _load_promptbox_module()
     snippet = {

@@ -37,12 +37,118 @@ _WORKBENCH_COPY = {
     "intro": "输入已有提示词，生成一个可审阅的候选版本。",
     "prompt_label": "原提示词",
     "optional_label": "补充信息（可选）",
-    "context_summary": "业务上下文",
+    "context_summary": "业务背景",
     "primary_action": "一键优化",
     "result_label": "候选版本",
+    "result_section_label": "优化结果",
+    "result_section_hint": "AI 生成的诊断、修改说明与候选版本，供你审阅后决定是否采纳。",
     "verify_label": "比较真实输出（可选）",
 }
 _WORKBENCH_STAGES = ("输入", "候选", "验证")
+
+
+def snippet_display_content(snippet) -> str:
+    """取一条 prompt 的当前展示正文：稳定版 → 当前版 → 顶层 content。
+    与主程序 prompt_display_content 语义一致。此处实现为 promptbox_mvp 包内的
+    解耦等价版——顶层 promptbox.py 已 import 本包，不能反向 import 顶层，否则循环依赖。"""
+    versions = snippet.get("versions") or []
+    by_id = {v.get("id"): v for v in versions}
+    stable_id = snippet.get("stable_version_id")
+    if stable_id and stable_id in by_id:
+        return by_id[stable_id].get("content", "") or ""
+    cur_id = snippet.get("current_version_id")
+    if cur_id and cur_id in by_id:
+        return by_id[cur_id].get("content", "") or ""
+    return snippet.get("content", "") or ""
+
+
+def snippet_merge_chunks(snippets, selected_ids) -> list[str]:
+    """把选中的多条 prompt 按「# 标题\\n正文」拼成块列表，供追加进输入材料。
+    只拼当前展示正文（见 snippet_display_content），跳过正文为空者；不拼 context。"""
+    chunks: list[str] = []
+    for s in snippets:
+        if s.get("id") not in selected_ids:
+            continue
+        title = s.get("title") or "未命名提示词"
+        content = snippet_display_content(s).strip()
+        if not content:
+            continue
+        chunks.append(f"# {title}\n{content}")
+    return chunks
+
+
+def merge_text_into_prompt(existing: str, merged: str) -> str:
+    """把拼接结果合入既有输入：空则直接放置，非空则以双换行追加。"""
+    existing = (existing or "").strip()
+    if existing:
+        return f"{existing}\n\n{merged}"
+    return merged
+
+
+def _category_paths(categories) -> dict[str, list[str]]:
+    by_id = {c.get("id"): c for c in categories if c.get("id")}
+    paths = {}
+    for cid in by_id:
+        path = []
+        current = cid
+        seen = set()
+        while current and current not in seen and current in by_id:
+            seen.add(current)
+            category = by_id[current]
+            path.append(category.get("name") or current)
+            current = category.get("parent_id")
+        paths[cid] = list(reversed(path))
+    return paths
+
+
+def build_branch_payload(snippets, selected_ids, categories) -> dict[str, Any]:
+    """Build a stable, structured payload for a selected multi-prompt branch."""
+    paths = _category_paths(categories or [])
+    items = []
+    for order, snippet in enumerate(snippets or []):
+        if snippet.get("id") not in selected_ids:
+            continue
+        content = snippet_display_content(snippet).strip()
+        if not content:
+            continue
+        items.append({
+            "id": snippet.get("id"),
+            "title": snippet.get("title") or "未命名提示词",
+            "category_path": paths.get(snippet.get("category_id"), []),
+            "content": content,
+            "order": order,
+        })
+    return {"is_branch": len(items) > 1, "items": items}
+
+
+def branch_to_prompt(payload: dict[str, Any]) -> str:
+    """Render a branch payload as one runnable prompt while preserving boundaries."""
+    return branch_display_text(payload)
+
+
+def branch_display_text(payload: dict[str, Any]) -> str:
+    """Render a structured branch without losing category paths."""
+    chunks = []
+    for item in payload.get("items", []):
+        path = "/".join(item.get("category_path") or [])
+        title = item.get("title") or "未命名提示词"
+        heading = f"# {path + '/' if path else ''}{title}"
+        chunks.append(f"{heading}\n{item.get('content', '').strip()}")
+    return "\n\n".join(chunks)
+
+
+def format_branch_candidate(payload: dict[str, Any]) -> str:
+    """Render branch candidate items and their explicit structural changes."""
+    labels = {"unchanged": "保留", "modified": "修改", "merged": "合并", "split": "拆分", "added": "新增", "removed": "删除"}
+    lines = []
+    for item in payload.get("items", []):
+        path = "/".join(item.get("category_path") or [])
+        title = item.get("title") or "未命名提示词"
+        lines.append(f"[{labels.get(item.get('change_type'), item.get('change_type', '变更'))}] {path + '/' if path else ''}{title}")
+        lines.append(item.get("content", ""))
+        if item.get("change_reason"):
+            lines.append(f"理由：{item['change_reason']}")
+    return "\n\n".join(lines)
 
 
 def _workbench_theme(shared_theme=None) -> dict[str, str]:
@@ -187,6 +293,9 @@ class RepairWorkbench:
         self.ui_context_pack: dict[str, Any] | None = None
         self.ui_context_manifest: dict[str, Any] | None = None
         self.ui_context_budget: dict[str, Any] | None = None
+        self.ui_branch_payload: dict[str, Any] | None = None
+        self.branch_verification: dict[str, Any] | None = None
+        self.branch_decisions: dict[str, str] = {}
 
     def add_pairwise_case(
         self,
@@ -296,18 +405,32 @@ class RepairWorkbench:
             if isinstance(candidate_data, dict)
             else candidate_data
         )
-        result = self.run_pairwise_verify(
-            baseline_prompt=baseline_prompt,
-            candidate_prompt=candidate_prompt,
-            context_text=case["context_text"],
-            user_input=case["user_input"],
-            context_label=case["context_label"],
-            variables=variables,
-            context_hard_limit=context_hard_limit,
-            context_overflow_action=context_overflow_action,
-            model_context_window=model_context_window,
-            context_pack=context_pack or getattr(self, "ui_context_pack", None),
-        )
+        branch_candidate = self.analysis.get("branch_candidate") if self.analysis else None
+        if getattr(self, "ui_branch_payload", None) and isinstance(branch_candidate, dict):
+            branch_result = self.run_branch_pairwise_verify(
+                context_text=case["context_text"],
+                user_input=case["user_input"],
+                context_label=case["context_label"],
+                variables=variables,
+                context_hard_limit=context_hard_limit,
+                context_overflow_action=context_overflow_action,
+                model_context_window=model_context_window,
+                context_pack=context_pack or getattr(self, "ui_context_pack", None),
+            )
+            result = branch_result["verification"]
+        else:
+            result = self.run_pairwise_verify(
+                baseline_prompt=baseline_prompt,
+                candidate_prompt=candidate_prompt,
+                context_text=case["context_text"],
+                user_input=case["user_input"],
+                context_label=case["context_label"],
+                variables=variables,
+                context_hard_limit=context_hard_limit,
+                context_overflow_action=context_overflow_action,
+                model_context_window=model_context_window,
+                context_pack=context_pack or getattr(self, "ui_context_pack", None),
+            )
         run = {
             "id": case["id"],
             "snapshot_id": result.get("snapshot_id"),
@@ -395,6 +518,8 @@ class RepairWorkbench:
         self.pairwise_cases = []
         self.active_pairwise_case_id = None
         self._next_pairwise_case_number = 1
+        self.branch_verification = None
+        self.branch_decisions = {}
         return case
 
     def start_optimization(
@@ -431,7 +556,7 @@ class RepairWorkbench:
             raise ValueError("candidate already generated")
 
         failure = self.case["failure"]
-        result = self.service.repair(
+        repair_args = (
             failure["prompt"],
             failure["output"],
             self.case["comparison"]["input"],
@@ -439,6 +564,11 @@ class RepairWorkbench:
             self.mode,
             getattr(self, "ui_context_text", ""),
         )
+        branch_payload = getattr(self, "ui_branch_payload", None)
+        if branch_payload:
+            result = self.service.repair(*repair_args, branch=branch_payload)
+        else:
+            result = self.service.repair(*repair_args)
         self.analysis = deepcopy(result)
         self.case["analysis"] = {
             key: deepcopy(result.get(key))
@@ -450,6 +580,8 @@ class RepairWorkbench:
                 "quick_check",
                 "resolved_issue_codes",
                 "unresolved_issue_codes",
+                "branch_candidate",
+                "structure_diagnosis",
             )
             if key in result
         }
@@ -472,6 +604,18 @@ class RepairWorkbench:
             self.save_case(self.case)
         return self.case
 
+    def _require_branch_decisions(self) -> None:
+        if not (self.analysis and self.analysis.get("branch_candidate")):
+            return
+        candidate_branch = self.analysis["branch_candidate"]
+        expected = {
+            str(item.get("id"))
+            for item in candidate_branch.get("items", [])
+            if item.get("id")
+        }
+        if set(self.branch_decisions) != expected:
+            raise ValueError("多 Prompt 候选必须先逐条完成人工裁决")
+
     def record_verification(
         self,
         input_text: str,
@@ -484,6 +628,8 @@ class RepairWorkbench:
             raise ValueError("no repair case captured")
         if self.case.get("adopted_version_id") is not None:
             raise ValueError("case already adopted")
+        if passed:
+            self._require_branch_decisions()
 
         record_case_verification(
             self.case,
@@ -499,6 +645,8 @@ class RepairWorkbench:
 
         if self.adopt_candidate is None:
             raise ValueError("no adopt callback configured")
+        if passed:
+            self._require_branch_decisions()
         try:
             adopted_version_id = self.adopt_candidate(self.case)
         except Exception:
@@ -511,8 +659,8 @@ class RepairWorkbench:
             }
             self.case["status"] = "candidate_ready"
             raise
-        if not isinstance(adopted_version_id, str) or not adopted_version_id:
-            raise ValueError("adopt callback must return a version id")
+        if not isinstance(adopted_version_id, (str, list)) or not adopted_version_id:
+            raise ValueError("adopt callback must return a version id or ids")
 
         self.case["adopted_version_id"] = adopted_version_id
         self.case["status"] = "validated"
@@ -533,6 +681,8 @@ class RepairWorkbench:
         if self.case.get("adopted_version_id") is not None:
             raise ValueError("case already adopted")
 
+        if passed:
+            self._require_branch_decisions()
         record_case_pairwise_verification(
             self.case,
             runs,
@@ -547,6 +697,8 @@ class RepairWorkbench:
 
         if self.adopt_candidate is None:
             raise ValueError("no adopt callback configured")
+        if passed:
+            self._require_branch_decisions()
         try:
             adopted_version_id = self.adopt_candidate(self.case)
         except Exception:
@@ -559,14 +711,83 @@ class RepairWorkbench:
             }
             self.case["status"] = "candidate_ready"
             raise
-        if not isinstance(adopted_version_id, str) or not adopted_version_id:
-            raise ValueError("adopt callback must return a version id")
+        if not isinstance(adopted_version_id, (str, list)) or not adopted_version_id:
+            raise ValueError("adopt callback must return a version id or ids")
 
         self.case["adopted_version_id"] = adopted_version_id
         self.case["status"] = "validated"
         if self.save_case is not None:
             self.save_case(self.case)
         return self.case
+
+    def run_branch_pairwise_verify(
+        self,
+        context_text: str,
+        user_input: str = "",
+        context_label: str = "",
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Run the original and restructured multi-prompt branches side by side."""
+        baseline_branch = getattr(self, "ui_branch_payload", None)
+        candidate_branch = self.analysis.get("branch_candidate") if self.analysis else None
+        if not isinstance(baseline_branch, dict) or not baseline_branch.get("is_branch"):
+            raise ValueError("baseline branch is required")
+        if not isinstance(candidate_branch, dict) or not candidate_branch.get("items"):
+            raise ValueError("candidate branch is required")
+        verification = self.run_pairwise_verify(
+            baseline_prompt=branch_to_prompt(baseline_branch),
+            candidate_prompt=branch_to_prompt(candidate_branch),
+            context_text=context_text,
+            user_input=user_input,
+            context_label=context_label,
+            **kwargs,
+        )
+        self.branch_verification = {
+            "baseline_branch": deepcopy(baseline_branch),
+            "candidate_branch": deepcopy(candidate_branch),
+            "verification": deepcopy(verification),
+        }
+        return deepcopy(self.branch_verification)
+
+    def set_branch_decisions(self, decisions: dict[str, str]) -> dict[str, str]:
+        """Record an explicit human decision for every branch candidate item."""
+        candidate_branch = self.analysis.get("branch_candidate") if self.analysis else None
+        items = candidate_branch.get("items", []) if isinstance(candidate_branch, dict) else []
+        expected = {str(item.get("id")) for item in items if item.get("id")}
+        if set(decisions) != expected:
+            raise ValueError("每条分支候选都必须完成人工裁决")
+        allowed = {"adopt", "reject", "keep_original"}
+        if any(value not in allowed for value in decisions.values()):
+            raise ValueError("分支候选裁决必须是 adopt、reject 或 keep_original")
+        self.branch_decisions = dict(decisions)
+        if self.case is not None:
+            self.case["branch_decisions"] = deepcopy(self.branch_decisions)
+        return deepcopy(self.branch_decisions)
+
+    def build_adopted_branch(self) -> dict[str, Any]:
+        """Build the branch that is allowed to be written back after review."""
+        candidate_branch = self.analysis.get("branch_candidate") if self.analysis else None
+        items = candidate_branch.get("items", []) if isinstance(candidate_branch, dict) else []
+        expected = {str(item.get("id")) for item in items if item.get("id")}
+        if set(self.branch_decisions) != expected:
+            raise ValueError("每条分支候选都必须先完成裁决")
+        adopted = []
+        for item in items:
+            decision = self.branch_decisions[str(item["id"])]
+            if decision == "reject":
+                continue
+            if decision == "keep_original":
+                source_id = next(iter(item.get("source_ids") or []), None)
+                original = next((x for x in (getattr(self, "ui_branch_payload", {}) or {}).get("items", []) if x.get("id") == source_id), None)
+                if original is not None:
+                    kept = deepcopy(original)
+                    kept["source_ids"] = [source_id] if source_id else []
+                    kept["change_type"] = "unchanged"
+                    kept["change_reason"] = "人工保留原 Prompt"
+                    adopted.append(kept)
+                continue
+            adopted.append(deepcopy(item))
+        return {"is_branch": len(adopted) > 1, "items": adopted}
 
     def get_view(self) -> dict[str, Any]:
         if self.case is None:
@@ -602,6 +823,9 @@ class RepairWorkbench:
             "resolved_issue_codes": self.analysis.get("resolved_issue_codes", []) if self.analysis else [],
             "unresolved_issue_codes": self.analysis.get("unresolved_issue_codes", []) if self.analysis else [],
         }
+        if self.analysis and self.analysis.get("branch_candidate"):
+            view["branch_candidate"] = self.analysis["branch_candidate"]
+            view["structure_diagnosis"] = self.analysis.get("structure_diagnosis", [])
         return deepcopy(view)
 
     @staticmethod
@@ -670,7 +894,7 @@ class RepairWorkbench:
         if not isinstance(context_text, str) or not context_text.strip():
             context_text = ""
         if not isinstance(user_input, str) or not user_input.strip():
-            user_input = "（本次输入）"
+            user_input = "（本次材料）"
         pack_metadata = deepcopy(context_pack) if context_pack else None
         if pack_metadata:
             context_text = pack_metadata.get("text", context_text)
@@ -758,7 +982,7 @@ class RepairWorkbench:
         if not isinstance(context_text, str) or not context_text.strip():
             context_text = ""
         if not isinstance(user_input, str) or not user_input.strip():
-            user_input = "（本次输入）"
+            user_input = "（本次材料）"
         pack_metadata = deepcopy(context_pack) if context_pack else None
         if pack_metadata:
             context_text = pack_metadata.get("text", context_text)
@@ -867,8 +1091,26 @@ class RepairWorkbench:
         window.minsize(760, 620)
         window.configure(bg=colors["bg"])
 
+        # 图标处理：Windows Tk 上对 Toplevel 显式调用 iconbitmap/iconphoto 反而会
+        # 错装成默认灰色图标；正确做法是「不设置任何图标」，子窗口会自动继承父窗口
+        # （主 Toplevel self.win 已在 promptbox.py 经 apply_window_icon 挂上新 logo）。
+        # 若父窗口没图标（极少数情况），这里维持 Tk 默认，不做二次覆盖。
+
+        def _widget_bg(widget: Any) -> str:
+            """读取容器当前背景，供 label 默认继承，避免在卡片内出现白框。
+
+            卡片（Frame）用 panel 色，窗口用 bg 色；label 默认跟随父容器，
+            保证与所在卡片视觉一致，不再用窗口 bg 色平铺出浅一档的矩形。
+            显式传入 bg= 时优先。
+            """
+            try:
+                return widget.cget("bg") or colors["bg"]
+            except Exception:
+                return colors["bg"]
+
         def make_label(parent_, text="", *, size=10, bold=False, color=None, **kwargs):
-            return tk.Label(parent_, text=text, bg=colors["bg"], fg=color or colors["fg"],
+            label_bg = kwargs.pop("bg", None) or _widget_bg(parent_)
+            return tk.Label(parent_, text=text, bg=label_bg, fg=color or colors["fg"],
                             font=(colors["font"], size, "bold" if bold else "normal"), **kwargs)
 
         def make_button(parent_, text, command, *, primary=False, danger=False, **kwargs):
@@ -884,7 +1126,8 @@ class RepairWorkbench:
                              font=(colors["font"], 10, "bold" if primary else "normal"), **kwargs)
 
         def make_legacy_label(parent_, text="", *, color=None, font=None, bg=None, **kwargs):
-            return tk.Label(parent_, text=text, bg=bg or colors["bg"], fg=color or colors["fg"],
+            label_bg = bg or _widget_bg(parent_)
+            return tk.Label(parent_, text=text, bg=label_bg, fg=color or colors["fg"],
                             font=font or (colors["font"], 9), **kwargs)
 
         def make_legacy_text(parent_, *, height=5, state="normal", **kwargs):
@@ -980,12 +1223,228 @@ class RepairWorkbench:
         prompt_card = tk.Frame(inner, bg=colors["panel"], padx=12, pady=12,
                                highlightbackground=colors["border"], highlightthickness=1)
         prompt_card.pack(fill="x", pady=(0, 12))
-        make_label(prompt_card, _WORKBENCH_COPY["prompt_label"], size=11, bold=True).pack(anchor="w")
+        prompt_header = tk.Frame(prompt_card, bg=colors["panel"])
+        prompt_header.pack(fill="x")
+        make_label(prompt_header, _WORKBENCH_COPY["prompt_label"], size=11, bold=True).pack(side="left")
         prompt_text = make_text(prompt_card, height=10)
         prompt_text.pack(fill="x", pady=(7, 0))
         baseline_content = getattr(self, "ui_baseline_content", None)
         if baseline_content:
             prompt_text.insert("1.0", baseline_content)
+
+        # ── 从 PromptBox 内部选择输入材料（单条 / 多选 / 整文件夹）──
+        # 只从内部 prompt 集合选取（ui_available_snippets / ui_available_categories），
+        # 不访问外部磁盘；选中的多条按「# 标题 + content」拼进原提示词输入框。
+        # 视觉：左侧树形文件夹（含子分类，点击即勾选/取消其下全部 prompt），
+        #        右侧预览已选内容，全部沿用主视觉 colors 变量，与产品主题一致。
+        def _open_internal_picker() -> None:
+            internal_snippets = getattr(self, "ui_available_snippets", None) or []
+            categories = getattr(self, "ui_available_categories", None) or []
+            if not internal_snippets:
+                messagebox.showinfo(
+                    "从 PromptBox 选择", "PromptBox 里还没有任何提示词，请先新建或导入。",
+                    parent=window,
+                )
+                return
+
+            try:
+                import tkinter.ttk as ttk
+            except ImportError:
+                ttk = None
+
+            picker = tk.Toplevel(window)
+            picker.title("从 PromptBox 选择输入材料")
+            picker.geometry("760x540")
+            picker.configure(bg=colors["bg"])
+            picker.transient(window)
+            picker.grab_set()
+
+            # 已选集合：snippet_id → snippet（树节点勾选 + 右侧预览共用）
+            selected: dict[str, dict[str, Any]] = {}
+
+            def _snippet_content(s: dict[str, Any]) -> str:
+                """取该 prompt 当前应展示的正文（稳定版优先 → 当前版 → 顶层）。
+                复用模块级 snippet_display_content，语义与主程序一致。"""
+                return snippet_display_content(s)
+
+            def cat_children(parent_id: str) -> list[str]:
+                return [c["id"] for c in categories if c.get("parent_id") == parent_id]
+
+            def cat_tree_roots() -> list[str]:
+                return [c["id"] for c in categories if c.get("parent_id") in (None, "")]
+
+            def cat_label(cid: str) -> str:
+                for c in categories:
+                    if c.get("id") == cid:
+                        return c.get("name") or "未命名"
+                return "未命名"
+
+            def snippets_in(cat_id: str) -> list[dict[str, Any]]:
+                # 当前分类 + 全部子孙分类下的非删除 prompt
+                ids = {cat_id}
+                frontier = [cat_id]
+                while frontier:
+                    cur = frontier.pop()
+                    for child in cat_children(cur):
+                        if child not in ids:
+                            ids.add(child)
+                            frontier.append(child)
+                return [s for s in internal_snippets
+                        if not s.get("_deleted") and s.get("category_id") in ids and (_snippet_content(s) or s.get("title"))]
+
+            def all_snippets() -> list[dict[str, Any]]:
+                return [s for s in internal_snippets
+                        if not s.get("_deleted") and (_snippet_content(s) or s.get("title"))]
+
+            # ── ttk 样式就地注册（幂等，保证独立打开工作台也有主视觉）──
+            style_name = "PB.WorkbenchPicker.Treeview"
+            if ttk is not None:
+                _st = ttk.Style()
+                _st.theme_use("clam")
+                _st.configure(style_name,
+                              background=colors["input"], foreground=colors["fg"],
+                              fieldbackground=colors["input"], font=(colors["font"], 10),
+                              rowheight=30, borderwidth=0)
+                _st.map(style_name, background=[("selected", colors["accent"])],
+                        foreground=[("selected", colors["primary_fg"])])
+
+            # ── 布局：左树 + 右预览 ──
+            body = tk.Frame(picker, bg=colors["bg"])
+            body.pack(fill="both", expand=True, padx=12, pady=(12, 4))
+            left_frame = tk.Frame(body, bg=colors["bg"])
+            left_frame.pack(side="left", fill="both", expand=True, padx=(0, 8))
+            right_frame = tk.Frame(body, bg=colors["bg"])
+            right_frame.pack(side="left", fill="both", expand=True, padx=(8, 0))
+
+            make_label(left_frame, "选择分类（勾选即选中该分类及子分类下的所有提示词）：",
+                       color=colors["fg"], size=10).pack(anchor="w")
+            tree_frame = tk.Frame(left_frame, bg=colors["bg"])
+            tree_frame.pack(fill="both", expand=True, pady=(5, 0))
+            cat_tree = ttk.Treeview(tree_frame, show="tree", style=style_name, selectmode="none") if ttk else None
+            if cat_tree is not None:
+                vsb = make_legacy_scrollbar(tree_frame, cat_tree.yview)
+                cat_tree.configure(yscrollcommand=vsb.set)
+                cat_tree.pack(side="left", fill="both", expand=True)
+                vsb.pack(side="right", fill="y")
+            else:
+                make_label(tree_frame, "（当前环境无 ttk，树形不可用）", color=colors["dim"], size=10).pack(anchor="w")
+
+            # 已选预览
+            make_label(right_frame, "已选内容预览：", color=colors["fg"], size=10).pack(anchor="w")
+            preview_list = make_legacy_listbox(right_frame, height=14, selectmode="single")
+            preview_list.pack(fill="both", expand=True, pady=(5, 0))
+
+            selected_lbl_var = tk.StringVar(value="已选 0 条")
+            make_label(picker, "", color=colors["dim"], size=10, textvariable=selected_lbl_var).pack(anchor="w", padx=12)
+
+            # ── 树节点 ↔ prompt 映射 ──
+            node_to_cat: dict[str, str] = {}   # tree item -> category id
+
+            def _insert_cat_node(parent_item: str, cid: str) -> None:
+                item = cat_tree.insert(parent_item, "end", text="☐ " + cat_label(cid))
+                node_to_cat[item] = cid
+                for child in cat_children(cid):
+                    _insert_cat_node(item, child)
+
+            def build_tree() -> None:
+                cat_tree.delete(*cat_tree.get_children())
+                node_to_cat.clear()
+                for root_cid in cat_tree_roots():
+                    _insert_cat_node("", root_cid)
+                # 「全部」根节点
+                all_item = cat_tree.insert("", 0, text="☐ 全部")
+                node_to_cat[all_item] = "__all__"
+
+            def refresh_selected_label() -> None:
+                selected_lbl_var.set(f"已选 {len(selected)} 条")
+
+            def refresh_preview() -> None:
+                preview_list.delete(0, "end")
+                for s in internal_snippets:
+                    if s.get("id") in selected:
+                        preview_list.insert("end", s.get("title") or "未命名提示词")
+                refresh_selected_label()
+
+            def update_check_marks() -> None:
+                # 根据勾选状态重绘节点文字前缀
+                for item, cid in node_to_cat.items():
+                    if cid == "__all__":
+                        label = "☑ 全部" if len(selected) == len(all_snippets()) and all_snippets() else "☐ 全部"
+                    else:
+                        # 该分类（含子孙）下所有可选的都进 selected 才显示勾选
+                        cat_items = snippets_in(cid)
+                        full = bool(cat_items) and all(s["id"] in selected for s in cat_items)
+                        label = ("☑ " if full else "☐ ") + cat_label(cid)
+                    cat_tree.item(item, text=label)
+
+            def toggle_node(item: str) -> None:
+                cid = node_to_cat.get(item)
+                if cid is None:
+                    return
+                if cid == "__all__":
+                    # 全选 / 全不选
+                    if len(selected) == len(all_snippets()) and all_snippets():
+                        selected.clear()
+                    else:
+                        for s in all_snippets():
+                            selected[s["id"]] = s
+                else:
+                    cat_items = snippets_in(cid)
+                    cat_ids = {s["id"] for s in cat_items}
+                    if cat_ids and all(sid in selected for sid in cat_ids):
+                        for sid in cat_ids:
+                            selected.pop(sid, None)
+                    else:
+                        for s in cat_items:
+                            selected[s["id"]] = s
+                update_check_marks()
+                refresh_preview()
+
+            if cat_tree is not None:
+                cat_tree.bind("<Button-1>", lambda event: _tree_click(event))
+                build_tree()
+
+            def _tree_click(event) -> None:
+                region = cat_tree.identify("region", event.x, event.y)
+                if region == "cell" or region == "tree":
+                    item = cat_tree.identify_row(event.y)
+                    if item:
+                        toggle_node(item)
+                cat_tree.selection_remove(*cat_tree.selection())
+
+            # ── 底部操作 ──
+            def clear_all() -> None:
+                selected.clear()
+                self.ui_branch_payload = None
+                update_check_marks()
+                refresh_preview()
+
+            def confirm() -> None:
+                if not selected:
+                    messagebox.showinfo("从 PromptBox 选择", "还没有选中任何提示词。", parent=picker)
+                    return
+                chunks = snippet_merge_chunks(internal_snippets, set(selected.keys()))
+                if not chunks:
+                    messagebox.showinfo("从 PromptBox 选择", "选中的提示词没有可拼入的正文内容。", parent=picker)
+                    return
+                merged = branch_display_text(build_branch_payload(internal_snippets, set(selected.keys()), categories))
+                self.ui_branch_payload = build_branch_payload(internal_snippets, set(selected.keys()), categories)
+                existing = prompt_text.get("1.0", "end-1c").strip()
+                if existing:
+                    prompt_text.insert("end", f"\n\n{merged}")
+                else:
+                    prompt_text.insert("1.0", merged)
+                picker.destroy()
+                refresh_variable_inputs()
+
+            btn_row = tk.Frame(picker, bg=colors["bg"])
+            btn_row.pack(fill="x", padx=12, pady=(6, 12))
+            make_button(btn_row, "清空重选", clear_all).pack(side="left", padx=(0, 6))
+            make_button(btn_row, "确定拼接", confirm, primary=True).pack(side="right")
+
+        # 从 PromptBox 内部选择单条/多选/整文件夹，拼接为输入材料（复用内部集合，不访问外部磁盘）
+        make_button(prompt_header, "从 PromptBox 选择", _open_internal_picker).pack(side="right")
+
         variable_entries: dict[str, Any] = {}
         variable_frame = tk.Frame(inner, bg=colors["bg"])
         variable_frame.pack(fill="x", pady=(0, 12))
@@ -1048,7 +1507,7 @@ class RepairWorkbench:
         make_label(optional_body, "失败输出（可选）", color=colors["dim"]).pack(anchor="w")
         output_text = make_text(optional_body, height=3)
         output_text.pack(fill="x", pady=(3, 0))
-        make_label(optional_body, "触发输入（可选）", color=colors["dim"]).pack(anchor="w", pady=(8, 0))
+        make_label(optional_body, "本次材料（可选）", color=colors["dim"]).pack(anchor="w", pady=(8, 0))
         comparison_text = make_text(optional_body, height=3)
         comparison_text.pack(fill="x", pady=(3, 0))
         make_label(optional_body, "优化目标（可选）", color=colors["dim"]).pack(anchor="w", pady=(8, 0))
@@ -1062,7 +1521,7 @@ class RepairWorkbench:
         make_label(context_frame, _WORKBENCH_COPY["context_summary"], size=10, bold=True).pack(anchor="w")
         make_label(
             context_frame,
-            "用于帮助 AI 理解场景；验证时会同时提供给原版和候选版。",
+            "你长期所处的业务环境（项目背景、公司/品类/团队背景）；验证时会同时提供给原版和候选版，作为共同运行条件。",
             color=colors["dim"],
         ).pack(anchor="w", pady=(2, 6))
         ctx_buttons = tk.Frame(context_frame, bg=colors["panel"])
@@ -1129,10 +1588,14 @@ class RepairWorkbench:
                 f"已载入 {len(content):,} 字符（约 {tokens:,} token）{source} · {capacity_note}"
             )
 
-        # 从主编辑器带入的上下文（snippet["context"]）预填
+        # ── 接通断线：验证面板默认复用优化阶段实际发送的业务背景 ──
+        # 优先取优化时存下的 self.ui_context_text（1630），其次才是主编辑器带入的
+        # snippet["context"]（self.ui_context）。框内已有内容则不重复插入。
+        ui_context_text_value = getattr(self, "ui_context_text", None)
         ui_context = getattr(self, "ui_context", None)
-        if ui_context:
-            context_text.insert("1.0", ui_context)
+        prefill_context = ui_context_text_value or ui_context
+        if prefill_context and not context_text.get("1.0", "end-1c").strip():
+            context_text.insert("1.0", prefill_context)
             ctx_label_var.set("提示词自带")
             refresh_context_info()
 
@@ -1155,7 +1618,7 @@ class RepairWorkbench:
             try:
                 manifest, pack = build_context_from_selection(paths)
             except ValueError as exc:
-                messagebox.showerror("业务上下文", str(exc), parent=window)
+                messagebox.showerror("业务背景", str(exc), parent=window)
                 return
             context_text.delete("1.0", tk.END)
             context_text.insert("1.0", pack.text)
@@ -1180,15 +1643,15 @@ class RepairWorkbench:
             refresh_context_info()
             failures = [item for item in manifest.entries if item.status != "included"]
             if failures:
-                messagebox.showinfo("业务上下文", f"已组装 {pack.file_count} 个文件；{len(failures)} 个文件被排除或解析失败。", parent=window)
+                messagebox.showinfo("业务背景", f"已组装 {pack.file_count} 个文件；{len(failures)} 个文件被排除或解析失败。", parent=window)
 
         def load_clipboard_ui() -> None:
             if pyperclip is None:
-                messagebox.showerror("业务上下文", "未安装 pyperclip，无法读取剪贴板。", parent=window)
+                messagebox.showerror("业务背景", "未安装 pyperclip，无法读取剪贴板。", parent=window)
                 return
             content = pyperclip.paste()
             if not content or not content.strip():
-                messagebox.showinfo("业务上下文", "剪贴板为空。", parent=window)
+                messagebox.showinfo("业务背景", "剪贴板为空。", parent=window)
                 return
             context_text.delete("1.0", tk.END)
             context_text.insert("1.0", content)
@@ -1212,6 +1675,15 @@ class RepairWorkbench:
         result_frame = tk.Frame(inner, bg=colors["bg"])
         result_frame.pack(fill="x", pady=(0, 12))
         result_frame.pack_forget()
+        # ── 优化结果分组标题：与「补充信息（可选）」同级，明确这是 AI 产物 ──
+        result_header = tk.Frame(result_frame, bg=colors["bg"])
+        result_header.pack(fill="x", pady=(20, 8))
+        make_label(result_header, _WORKBENCH_COPY["result_section_label"], size=11, bold=True).pack(anchor="w")
+        make_label(
+            result_header,
+            _WORKBENCH_COPY["result_section_hint"],
+            color=colors["dim"],
+        ).pack(anchor="w", pady=(2, 0))
         diagnosis_card = tk.Frame(result_frame, bg=colors["panel"], padx=12, pady=10)
         diagnosis_card.pack(fill="x", pady=(0, 8))
         make_label(diagnosis_card, "诊断", size=10, bold=True).pack(anchor="w")
@@ -1227,6 +1699,12 @@ class RepairWorkbench:
         make_label(candidate_card, _WORKBENCH_COPY["result_label"], size=11, bold=True).pack(anchor="w")
         candidate_text = make_text(candidate_card, height=12, state="disabled")
         candidate_text.pack(fill="x", pady=(7, 0))
+        branch_text = make_text(candidate_card, height=12, state="disabled")
+        branch_text.pack(fill="x", pady=(7, 0))
+        branch_text.pack_forget()
+        branch_decision_frame = tk.Frame(candidate_card, bg=colors["panel"])
+        branch_decision_vars: dict[str, Any] = {}
+        branch_decision_frame.pack_forget()
         # ── 验证与成对对比面板：候选生成后仍默认折叠 ──
         verify_frame = tk.Frame(result_frame, bg=colors["bg"])
         verify_frame.pack(fill="x", pady=(12, 0))
@@ -1251,9 +1729,20 @@ class RepairWorkbench:
 
         verify_header.bind("<Button-1>", lambda _event: toggle_verify())
 
-        make_legacy_label(verify_box, "验证输入（单次代表性任务输入）：", color=colors["fg"]).pack(anchor="w")
+        make_legacy_label(verify_box, "本次材料（单次代表性任务输入）：", color=colors["fg"]).pack(anchor="w")
         verification_input_text = make_legacy_text(verify_box, height=3, width=80)
         verification_input_text.pack(fill="x")
+
+        def sync_verification_input_from_optimization() -> None:
+            """接通断线：验证面板默认复用优化阶段已存的「本次材料」。
+
+            在候选生成后调用：把优化时用户填的本次材料（存于
+            ``self.case["comparison"]["input"]``）带入验证框，保证优化与
+            验证走在同一条路径；用户仍可改（换场景验证），默认是优化时那份。
+            """
+            if self.case and self.case.get("comparison", {}).get("input"):
+                verification_input_text.delete("1.0", tk.END)
+                verification_input_text.insert("1.0", self.case["comparison"]["input"])
 
         # 多案例编排：案例字段在上方编辑，运行状态保存在控制器而非 UI 临时变量。
         cases_frame = tk.Frame(verify_box, bg=colors["panel"])
@@ -1306,10 +1795,68 @@ class RepairWorkbench:
         review_frame = tk.Frame(verify_box, bg=colors["panel"])
         review_frame.pack(fill="x", pady=(10, 0))
 
+        def render_branch_decisions(branch_value: dict[str, Any] | None) -> None:
+            for child in branch_decision_frame.winfo_children():
+                child.destroy()
+            branch_decision_vars.clear()
+            if not branch_value:
+                branch_decision_frame.pack_forget()
+                return
+            branch_decision_frame.pack(fill="x", pady=(8, 0))
+            make_label(
+                branch_decision_frame,
+                "逐条人工裁决（写回前必须全部选择）：",
+                color=colors["fg"], size=10, bold=True,
+            ).pack(anchor="w")
+            labels = {"unchanged": "保留", "modified": "修改", "merged": "合并", "split": "拆分", "added": "新增", "removed": "删除"}
+            for item in branch_value.get("items", []):
+                item_id = str(item.get("id") or "")
+                if not item_id:
+                    continue
+                path = "/".join(item.get("category_path") or [])
+                title = item.get("title") or "未命名提示词"
+                header = f"[{labels.get(item.get('change_type'), item.get('change_type', '变更'))}] {path + '/' if path else ''}{title}"
+                source_ids = ", ".join(item.get("source_ids") or []) or "无来源（新增）"
+                make_label(
+                    branch_decision_frame,
+                    f"{header} · 来源：{source_ids}",
+                    color=colors["fg"], anchor="w", wraplength=760,
+                ).pack(anchor="w", pady=(6, 0))
+                if item.get("change_reason"):
+                    make_label(
+                        branch_decision_frame, f"理由：{item['change_reason']}",
+                        color=colors["dim"], anchor="w", wraplength=760,
+                    ).pack(anchor="w")
+                decision_var = tk.StringVar(value="")
+                branch_decision_vars[item_id] = decision_var
+                options = tk.Frame(branch_decision_frame, bg=colors["panel"])
+                options.pack(fill="x")
+                make_legacy_radio(options, "采纳", decision_var, "adopt", bg=colors["panel"]).pack(side="left")
+                make_legacy_radio(options, "拒绝", decision_var, "reject", bg=colors["panel"]).pack(side="left", padx=(8, 0))
+                make_legacy_radio(options, "保留原 Prompt", decision_var, "keep_original", bg=colors["panel"]).pack(side="left", padx=(8, 0))
+
+        def collect_branch_decisions() -> None:
+            if not (self.analysis and self.analysis.get("branch_candidate")):
+                return
+            self.set_branch_decisions({
+                item_id: variable.get()
+                for item_id, variable in branch_decision_vars.items()
+            })
+
         def show_candidate() -> None:
             view = self.get_view()
             result_frame.pack(fill="x", pady=(0, 12))
             set_stage("候选")
+            # ── 接通断线：候选生成后，把优化阶段实际使用的「业务背景」
+            #    与「本次材料」带入验证面板，保证优化与验证走同一条路径。──
+            sync_verification_input_from_optimization()
+            baseline_context = getattr(self, "ui_context_text", None)
+            if baseline_context:
+                context_text.delete("1.0", tk.END)
+                context_text.insert("1.0", baseline_context)
+                if not ctx_label_var.get().strip():
+                    ctx_label_var.set("提示词自带")
+                refresh_context_info()
             diagnosis_label.config(text=view["diagnosis"] or "未提供额外诊断。")
             audit_label.config(
                 text=_format_audit_summary(
@@ -1326,6 +1873,21 @@ class RepairWorkbench:
             if view["candidate"]:
                 candidate_text.insert("1.0", view["candidate"]["content"])
             candidate_text.config(state="disabled")
+            branch_value = view.get("branch_candidate")
+            if branch_value:
+                baseline_title_var.set("原分支输出 (Baseline Branch)")
+                candidate_title_var.set("重构分支输出 (Restructured Branch)")
+            else:
+                baseline_title_var.set("基线版本输出 (Baseline)")
+                candidate_title_var.set("候选版本输出 (Candidate)")
+            branch_text.config(state="normal")
+            branch_text.delete("1.0", tk.END)
+            if branch_value:
+                branch_text.insert("1.0", format_branch_candidate(branch_value))
+                branch_text.pack(fill="x", pady=(7, 0))
+            else:
+                branch_text.pack_forget()
+            render_branch_decisions(branch_value)
             for child in review_frame.winfo_children():
                 child.destroy()
             make_button(review_frame, "继续编辑", lambda: choose("edit")).pack(side="left")
@@ -1452,6 +2014,7 @@ class RepairWorkbench:
 
         def verify(passed: bool) -> None:
             try:
+                collect_branch_decisions()
                 raw_rating = rating_entry.get().strip()
                 rating = int(raw_rating) if raw_rating else None
                 input_content = _strip_text_widget_trailing_newline(verification_input_text.get("1.0", tk.END))

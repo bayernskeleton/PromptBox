@@ -3,10 +3,18 @@ from pathlib import Path
 
 import pytest
 
+from promptbox_mvp.contract import create_candidate
 from promptbox_mvp.workbench import (
     RepairWorkbench,
     _format_audit_summary,
     _strip_text_widget_trailing_newline,
+    snippet_display_content,
+    snippet_merge_chunks,
+    merge_text_into_prompt,
+    build_branch_payload,
+    branch_display_text,
+    format_branch_candidate,
+    branch_to_prompt,
 )
 
 
@@ -50,6 +58,179 @@ class FakeService:
         }
 
 
+def test_build_branch_payload_keeps_category_path_and_order():
+    snippets = [
+        {"id": "s2", "title": "子任务", "content": "执行", "category_id": "c2"},
+        {"id": "s1", "title": "入口", "content": "开始", "category_id": "c1"},
+    ]
+    categories = [
+        {"id": "c1", "name": "写作辅助", "parent_id": ""},
+        {"id": "c2", "name": "文字质检", "parent_id": "c1"},
+    ]
+    result = build_branch_payload(snippets, {"s1", "s2"}, categories)
+    assert result["is_branch"] is True
+    assert [item["id"] for item in result["items"]] == ["s2", "s1"]
+    assert result["items"][0]["category_path"] == ["写作辅助", "文字质检"]
+    assert result["items"][0]["content"] == "执行"
+
+
+def test_branch_display_text_includes_category_path():
+    payload = {"items": [{"title": "入口", "category_path": ["主类", "入口"], "content": "开始"}]}
+    assert branch_display_text(payload) == "# 主类/入口/入口\n开始"
+
+
+def test_branch_to_prompt_preserves_order_and_paths():
+    branch = {"items": [
+        {"title": "入口", "category_path": ["主类"], "content": "先开始"},
+        {"title": "回退", "category_path": ["主类", "兜底"], "content": "再回退"},
+    ]}
+    assert branch_to_prompt(branch) == "# 主类/入口\n先开始\n\n# 主类/兜底/回退\n再回退"
+
+
+def test_format_branch_candidate_groups_changes_and_preserves_ids():
+    text = format_branch_candidate({"items": [{
+        "id": "s1", "title": "入口", "category_path": ["主类"],
+        "content": "开始", "source_ids": ["s1"],
+        "change_type": "modified", "change_reason": "补充边界"
+    }]})
+    assert "主类/入口" in text
+    assert "修改" in text
+    assert "补充边界" in text
+
+
+def test_run_branch_pairwise_verify_runs_original_and_restructured_branches():
+    workbench = RepairWorkbench(FakeVerifyService())
+    capture_bound_case(workbench)
+    workbench.analysis = {
+        "candidate": {"content": "兼容候选文本"},
+        "branch_candidate": {"items": [
+            {"title": "入口", "category_path": ["主类"], "content": "候选入口"},
+            {"title": "回退", "category_path": ["主类"], "content": "候选回退"},
+        ]},
+    }
+    workbench.ui_branch_payload = {"is_branch": True, "items": [
+        {"title": "入口", "category_path": ["主类"], "content": "原入口"},
+        {"title": "回退", "category_path": ["主类"], "content": "原回退"},
+    ]}
+    result = workbench.run_branch_pairwise_verify("上下文", "用户输入")
+    assert result["baseline_branch"]["items"][0]["content"] == "原入口"
+    assert len(workbench.service.verify_calls) == 2
+    assert workbench.service.verify_calls[0][0].startswith("# 主类/入口")
+    assert "候选回退" in workbench.service.verify_calls[1][0]
+    assert workbench.branch_verification["verification"]["candidate"]["output"] == "模型验证输出"
+
+
+def test_run_branch_pairwise_verify_requires_both_branch_payloads():
+    workbench = RepairWorkbench(FakeVerifyService())
+    capture_bound_case(workbench)
+    workbench.analysis = {"candidate": {"content": "兼容候选文本"}}
+    with pytest.raises(ValueError, match="branch"):
+        workbench.run_branch_pairwise_verify("上下文", "用户输入")
+
+
+def test_review_branch_candidate_requires_decision_for_each_item():
+    workbench = RepairWorkbench(FakeVerifyService())
+    workbench.ui_branch_payload = {"is_branch": True, "items": [
+        {"id": "s1", "title": "入口", "content": "原入口"},
+        {"id": "s2", "title": "回退", "content": "原回退"},
+    ]}
+    workbench.analysis = {"branch_candidate": {"items": [
+        {"id": "c1", "title": "入口", "content": "新入口", "source_ids": ["s1"], "change_type": "modified", "change_reason": "补边界"},
+        {"id": "c2", "title": "回退", "content": "新回退", "source_ids": ["s2"], "change_type": "modified", "change_reason": "补兜底"},
+    ]}}
+    with pytest.raises(ValueError, match="每条"):
+        workbench.set_branch_decisions({"c1": "adopt"})
+    result = workbench.set_branch_decisions({"c1": "adopt", "c2": "reject"})
+    assert result["c1"] == "adopt"
+    assert workbench.branch_decisions == result
+
+
+def test_build_adopted_branch_marks_kept_original_with_source_and_unchanged_type():
+    workbench = RepairWorkbench(FakeVerifyService())
+    workbench.ui_branch_payload = {"is_branch": True, "items": [
+        {"id": "s1", "title": "入口", "category_path": ["主类"], "content": "原入口"},
+    ]}
+    workbench.analysis = {"branch_candidate": {"items": [
+        {"id": "c1", "title": "入口", "category_path": ["主类"], "content": "候选入口", "source_ids": ["s1"],
+         "change_type": "modified", "change_reason": "待人工保留"},
+    ]}}
+    workbench.set_branch_decisions({"c1": "keep_original"})
+    branch = workbench.build_adopted_branch()
+    assert branch["items"] == [{
+        "id": "s1", "title": "入口", "category_path": ["主类"], "content": "原入口",
+        "source_ids": ["s1"], "change_type": "unchanged", "change_reason": "人工保留原 Prompt",
+    }]
+
+
+def test_build_adopted_branch_applies_add_remove_keep_and_modify_decisions():
+    workbench = RepairWorkbench(FakeVerifyService())
+    workbench.ui_branch_payload = {"is_branch": True, "items": [
+        {"id": "s1", "title": "入口", "category_path": ["主类"], "content": "原入口"},
+        {"id": "s2", "title": "旧回退", "category_path": ["主类"], "content": "原回退"},
+    ]}
+    workbench.analysis = {"branch_candidate": {"items": [
+        {"id": "c1", "title": "入口", "category_path": ["主类"], "content": "新入口", "source_ids": ["s1"], "change_type": "modified", "change_reason": "补边界"},
+        {"id": "c3", "title": "新兜底", "category_path": ["主类"], "content": "新增兜底", "source_ids": [], "change_type": "added", "change_reason": "补兜底"},
+    ]}}
+    workbench.set_branch_decisions({"c1": "adopt", "c3": "adopt"})
+    branch = workbench.build_adopted_branch()
+    assert [item["id"] for item in branch["items"]] == ["c1", "c3"]
+    assert branch["items"][0]["source_ids"] == ["s1"]
+
+
+def test_build_adopted_branch_rejects_incomplete_decisions():
+    workbench = RepairWorkbench(FakeVerifyService())
+    workbench.analysis = {"branch_candidate": {"items": [{"id": "c1", "content": "新"}]}}
+    with pytest.raises(ValueError, match="裁决"):
+        workbench.build_adopted_branch()
+
+
+def test_branch_decisions_are_persisted_on_repair_case_for_audit():
+    workbench = RepairWorkbench(FakeVerifyService())
+    capture_bound_case(workbench)
+    workbench.ui_branch_payload = {"is_branch": True, "items": [
+        {"id": "s1", "title": "入口", "content": "原入口"},
+    ]}
+    workbench.analysis = {"branch_candidate": {"items": [
+        {"id": "c1", "title": "入口", "content": "新入口", "source_ids": ["s1"],
+         "change_type": "modified", "change_reason": "补边界"},
+    ]}}
+    workbench.set_branch_decisions({"c1": "adopt"})
+    assert workbench.case["branch_decisions"] == {"c1": "adopt"}
+
+
+def test_run_pairwise_case_uses_original_and_candidate_branch_prompts():
+    workbench = RepairWorkbench(FakeVerifyService())
+    capture_bound_case(workbench)
+    workbench.ui_branch_payload = {"is_branch": True, "items": [
+        {"id": "s1", "title": "入口", "category_path": ["主类"], "content": "原入口"},
+        {"id": "s2", "title": "回退", "category_path": ["主类"], "content": "原回退"},
+    ]}
+    workbench.analysis = {"candidate": {"content": "兼容候选"}, "branch_candidate": {"items": [
+        {"id": "c1", "title": "入口", "category_path": ["主类"], "content": "新入口", "source_ids": ["s1"],
+         "change_type": "modified", "change_reason": "补边界"},
+        {"id": "c2", "title": "回退", "category_path": ["主类"], "content": "新回退", "source_ids": ["s2"],
+         "change_type": "modified", "change_reason": "补兜底"},
+    ]}}
+    pairwise_case = workbench.add_pairwise_case(user_input="输入", user_confirmed=True,
+                                                 source_type="real_business_replay")
+    result = workbench.run_pairwise_case(pairwise_case["id"])
+    assert result["baseline_output"] == "模型验证输出"
+    assert workbench.service.verify_calls[0][0].startswith("# 主类/入口")
+    assert "新回退" in workbench.service.verify_calls[1][0]
+
+
+def test_workbench_generate_candidate_passes_branch_payload():
+    wb = RepairWorkbench(FakeBranchService())
+    wb.capture_case(snippet_id="branch", base_version_id="v1", base_version_number=1,
+                    prompt="# 主类/入口\n开始\n\n# 主类/子任务\n执行",
+                    output="", comparison_input="", task_goal="")
+    wb.ui_branch_payload = {"is_branch": True, "items": [{"id": "s1", "content": "开始"}, {"id": "s2", "content": "执行"}]}
+    wb.mode = "A"
+    wb.generate_candidate()
+    assert wb.service.calls[0]["branch"]["is_branch"] is True
+
+
 def test_workbench_theme_accepts_shared_theme_tokens_and_styles_legacy_controls():
     source = WORKBENCH_SOURCE.read_text(encoding="utf-8")
     assert "def _workbench_theme(shared_theme=None)" in source
@@ -64,6 +245,21 @@ def test_workbench_theme_accepts_shared_theme_tokens_and_styles_legacy_controls(
     assert "make_legacy_checkbutton" in source
     assert "make_legacy_option_menu" in source
     assert "make_legacy_scrollbar" in source
+
+
+def test_internal_picker_uses_scoped_treeview_style_and_theme_scrollbar():
+    source = WORKBENCH_SOURCE.read_text(encoding="utf-8")
+    assert 'style_name = "PB.WorkbenchPicker.Treeview"' in source
+    assert "style=style_name" in source
+    assert 'make_legacy_scrollbar(tree_frame, cat_tree.yview)' in source
+
+
+def test_branch_review_ui_exposes_item_decisions_and_writes_them_before_recording():
+    source = WORKBENCH_SOURCE.read_text(encoding="utf-8")
+    assert "branch_decision_vars" in source
+    assert "keep_original" in source
+    assert "self.set_branch_decisions" in source
+    assert "run_branch_pairwise_verify" in source
 
 
 def make_workbench(adopt_candidate=None, save_case=None):
@@ -84,6 +280,26 @@ def capture_bound_case(workbench):
         comparison_input="验证输入",
         task_goal="提取待办",
     )
+
+
+class FakeBranchService:
+    def __init__(self):
+        self.calls = []
+
+    def repair(self, prompt, output="", comparison_input="", task_goal="", mode="", context="", branch=None):
+        self.calls.append({"prompt": prompt, "branch": branch})
+        return {
+            "diagnosis": "结构可优化",
+            "mode": "A",
+            "candidate": "兼容文本",
+            "branch_candidate": {"items": [{
+                "id": "s1", "title": "入口", "category_path": ["主类"],
+                "content": "开始", "source_ids": ["s1"],
+                "change_type": "modified", "change_reason": "补充边界"
+            }]},
+            "structure_diagnosis": [],
+            "reasons": ["调整结构"],
+        }
 
 
 class FakeVerifyService(FakeService):
@@ -150,6 +366,25 @@ def test_run_pairwise_verify_executes_both_baseline_and_candidate():
     assert result["candidate"]["output"] == "模型验证输出"
     assert result["baseline_latency_ms"] == 42
     assert result["candidate_latency_ms"] == 42
+
+
+def test_pairwise_verification_rejects_missing_branch_decisions_without_mutating_case():
+    workbench = make_workbench(adopt_candidate=lambda _case: "ver_x")
+    capture_bound_case(workbench)
+    workbench.analysis = {"candidate": {"content": "候选"}, "branch_candidate": {"items": [
+        {"id": "c1", "title": "入口", "content": "候选", "source_ids": ["s1"],
+         "change_type": "modified", "change_reason": "补边界"},
+    ]}}
+    create_candidate(workbench.case, "候选", ["补边界"])
+    run = {
+        "id": "run_1", "source_type": "real_business_replay", "user_confirmed": True,
+        "baseline_output": "原", "candidate_output": "新", "user_input": "输入",
+        "verdict": "candidate_better",
+    }
+    with pytest.raises(ValueError, match="逐条"):
+        workbench.record_pairwise_verification([run], "candidate_better", True)
+    assert workbench.case["status"] == "candidate_ready"
+    assert workbench.case["verification"]["status"] == "pending"
 
 
 def test_record_pairwise_verification_adopts_only_when_passed_and_calls_callback():
@@ -416,7 +651,7 @@ def test_run_verify_falls_back_to_generic_input_label_when_empty():
 
     workbench.run_verify("提示词", "上下文", "   ")
 
-    assert workbench.service.verify_calls[0][2] == "（本次输入）"
+    assert workbench.service.verify_calls[0][2] == "（本次材料）"
 
 
 def test_strip_text_widget_trailing_newline_preserves_intentional_multiple_newlines():
@@ -1033,3 +1268,81 @@ def test_pairwise_workbench_can_remove_and_select_cases_without_mutating_state()
     assert removed["id"] == first["id"]
     assert [case["id"] for case in workbench.get_pairwise_cases()] == [second["id"]]
     assert workbench.select_pairwise_case("missing") is None
+
+
+# ── 内部选择器：snippet 正文读取与拼接（独立于 GUI 的纯逻辑）──
+
+
+def _mk_snippet(sid, title="t", top_content="", versions=None, stable=None, current=None):
+    return {
+        "id": sid, "title": title,
+        "category_id": "cat_x", "content": top_content, "_deleted": False,
+        "versions": versions or [], "stable_version_id": stable, "current_version_id": current,
+    }
+
+
+def test_snippet_display_content_prefers_stable_version():
+    s = _mk_snippet(
+        "s1",
+        versions=[
+            {"id": "v1", "content": "当前版正文"},
+            {"id": "v2", "content": "稳定版正文"},
+        ],
+        stable="v2", current="v1",
+    )
+    assert snippet_display_content(s) == "稳定版正文"
+
+
+def test_snippet_display_content_falls_back_to_current_version():
+    s = _mk_snippet(
+        "s1",
+        versions=[{"id": "v1", "content": "当前版正文"}],
+        stable=None, current="v1",
+    )
+    assert snippet_display_content(s) == "当前版正文"
+
+
+def test_snippet_display_content_falls_back_to_top_content_when_no_versions():
+    s = _mk_snippet("s1", top_content="顶层正文", versions=[], stable=None, current=None)
+    assert snippet_display_content(s) == "顶层正文"
+
+
+def test_snippet_display_content_returns_empty_when_all_missing():
+    s = _mk_snippet("s1", top_content="", versions=[], stable=None, current=None)
+    assert snippet_display_content(s) == ""
+
+
+def test_snippet_merge_chunks_only_selected_and_skips_empty_body():
+    snippets = [
+        _mk_snippet("a", title="提示A", versions=[{"id": "v1", "content": "正文甲"}], current="v1"),
+        _mk_snippet("b", title="提示B", top_content=""),          # 正文为空 → 跳过
+        _mk_snippet("c", title="提示C", versions=[{"id": "v1", "content": "正文丙"}], current="v1"),
+    ]
+    chunks = snippet_merge_chunks(snippets, {"a", "c"})
+    assert chunks == ["# 提示A\n正文甲", "# 提示C\n正文丙"]
+
+
+def test_snippet_merge_chunks_prefers_real_version_body_over_empty_top_content():
+    snippets = [
+        _mk_snippet("a", title="提示A", top_content="", versions=[{"id": "v1", "content": "版本正文"}], current="v1"),
+    ]
+    chunks = snippet_merge_chunks(snippets, {"a"})
+    assert chunks == ["# 提示A\n版本正文"]
+
+
+def test_snippet_merge_chunks_skips_unselected():
+    snippets = [
+        _mk_snippet("a", title="提示A", versions=[{"id": "v1", "content": "正文甲"}], current="v1"),
+        _mk_snippet("b", title="提示B", versions=[{"id": "v1", "content": "正文乙"}], current="v1"),
+    ]
+    chunks = snippet_merge_chunks(snippets, {"b"})
+    assert chunks == ["# 提示B\n正文乙"]
+
+
+def test_merge_text_into_prompt_appends_when_existing():
+    assert merge_text_into_prompt("基线内容", "# 提示A\n正文") == "基线内容\n\n# 提示A\n正文"
+
+
+def test_merge_text_into_prompt_places_directly_when_empty():
+    assert merge_text_into_prompt("", "# 提示A\n正文") == "# 提示A\n正文"
+    assert merge_text_into_prompt("   ", "# 提示A\n正文") == "# 提示A\n正文"

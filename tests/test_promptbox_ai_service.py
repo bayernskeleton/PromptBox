@@ -177,6 +177,64 @@ def test_repair_rejects_invalid_mode(mode):
         RepairService(lambda messages: result).repair("p", "o", "i")
 
 
+def test_repair_branch_sends_structured_branch_and_returns_candidate():
+    captured = {}
+    branch_result = {
+        "diagnosis": "入口缺失",
+        "mode": "A",
+        "candidate": "兼容展示文本",
+        "branch_candidate": {"items": [{
+            "id": "s1", "title": "入口", "category_path": ["主类"],
+            "content": "开始", "source_ids": ["s1"],
+            "change_type": "modified", "change_reason": "补充入口约束"
+        }]},
+        "structure_diagnosis": [],
+        "reasons": ["补充入口"],
+    }
+    def transport(messages):
+        captured["messages"] = messages
+        return branch_result
+    service = RepairService(transport)
+    result = service.repair(
+        "兼容展示文本", mode="A",
+        branch={"is_branch": True, "items": [{"id": "s1", "content": "开始"}, {"id": "s2", "content": "执行"}]},
+    )
+    user_content = next(message["content"] for message in captured["messages"] if message["role"] == "user")
+    assert "分支结构 JSON" in user_content
+    assert result["branch_candidate"]["items"][0]["change_type"] == "modified"
+
+
+def test_repair_branch_allows_empty_content_for_removed_item():
+    result = {
+        "diagnosis": "删除冗余分支", "mode": "A", "candidate": "兼容文本", "reasons": ["删除"],
+        "branch_candidate": {"items": [{
+            "id": "s2", "title": "旧分支", "category_path": ["主类"], "content": "",
+            "source_ids": ["s2"], "change_type": "removed", "change_reason": "职责重复",
+        }]},
+    }
+    repaired = RepairService(lambda _messages: result).repair(
+        "文本", mode="A", branch={"is_branch": True, "items": [{"id": "s1"}, {"id": "s2"}]}
+    )
+    assert repaired["branch_candidate"]["items"][0]["change_type"] == "removed"
+
+
+def test_repair_branch_rejects_missing_branch_candidate():
+    service = RepairService(lambda _messages: {
+        "diagnosis": "结构问题", "mode": "A", "candidate": "文本", "reasons": ["原因"]
+    })
+    with pytest.raises(ValueError, match="branch_candidate"):
+        service.repair("文本", mode="A", branch={"is_branch": True, "items": [{"id": "s1"}, {"id": "s2"}]})
+
+
+def test_repair_branch_mode_b_keeps_single_prompt_compatibility():
+    result = {**VALID_RESULT, "mode": "B"}
+    repaired = RepairService(lambda _messages: result).repair(
+        "文本", mode="B", branch={"is_branch": True, "items": [{"id": "s1"}, {"id": "s2"}]}
+    )
+    assert repaired["mode"] == "B"
+    assert repaired["branch_candidate"] is None
+
+
 def test_repair_accepts_mode_a():
     result = {**VALID_RESULT, "mode": "A"}
     repaired = RepairService(lambda _messages: result).repair("p", "o", "i")

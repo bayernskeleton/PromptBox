@@ -89,10 +89,31 @@ def _validate_case(case):
         raise ValueError("invalid base version number")
     if case["verdict"] is not None and not isinstance(case["verdict"], dict):
         raise ValueError("invalid verdict")
-    if case["adopted_version_id"] is not None and (
-        not isinstance(case["adopted_version_id"], str) or not case["adopted_version_id"]
-    ):
-        raise ValueError("invalid adopted version id")
+    adopted_version_id = case["adopted_version_id"]
+    if adopted_version_id is not None:
+        if isinstance(adopted_version_id, str):
+            if not adopted_version_id:
+                raise ValueError("invalid adopted version id")
+        elif isinstance(adopted_version_id, list):
+            if not adopted_version_id or not all(isinstance(item, str) and item for item in adopted_version_id):
+                raise ValueError("invalid adopted version ids")
+        else:
+            raise ValueError("invalid adopted version id")
+    if "branch_decisions" in case:
+        decisions = case["branch_decisions"]
+        if not isinstance(decisions, dict) or any(
+            not isinstance(key, str) or value not in {"adopt", "reject", "keep_original"}
+            for key, value in decisions.items()
+        ):
+            raise ValueError("invalid branch decisions")
+    if "branch_writeback" in case:
+        writeback = case["branch_writeback"]
+        if not isinstance(writeback, dict) or writeback.get("status") != "completed":
+            raise ValueError("invalid branch writeback")
+        if not isinstance(writeback.get("written_ids"), list) or not all(
+            isinstance(item, str) and item for item in writeback["written_ids"]
+        ):
+            raise ValueError("invalid branch writeback ids")
     _validate_verification(case["verification"])
 
     candidates = case["candidates"]

@@ -128,6 +128,78 @@ def test_latest_run_times_keeps_newest_call_per_prompt():
     assert latest["a"] == "2026-08-26T12:00:00+00:00"
 
 
+def test_palette_copy_selected_uses_selected_result_and_keeps_variable_placeholders(monkeypatch):
+    from promptbox import PromptBox
+
+    app = object.__new__(PromptBox)
+    first = make_snippet("first", title="第一条")
+    second = make_snippet("second", title="第二条")
+    second["versions"][1]["content"] = "整理 {topic}"
+    app.palette_results = [first, second]
+    app.palette_selected = None
+    app.palette_selected_index = 1
+    app.palette_selected_version_id = None
+    app.palette_variable_fill_mode = False
+    copied = []
+    monkeypatch.setattr(
+        app,
+        "_palette_copy_text",
+        lambda snippet, version_id, content, variable_snapshot_id=None: copied.append(
+            (snippet["id"], version_id, content, variable_snapshot_id)
+        ) or True,
+    )
+
+    assert app._palette_copy_selected() is True
+    assert copied == [("second", "second-v2", "整理 {topic}", None)]
+
+
+def test_palette_fill_copy_with_no_values_copies_original_without_snapshot(monkeypatch):
+    from promptbox import PromptBox
+    from promptbox_mvp.prompt_variables import PromptTemplate
+
+    app = object.__new__(PromptBox)
+    snippet = make_snippet("variables")
+    template = PromptTemplate.from_text("写作 {topic}")
+    app.palette_variable_entries = {"topic": type("Entry", (), {"get": lambda self: "   "})()}
+    copied = []
+    monkeypatch.setattr(
+        app,
+        "_palette_copy_text",
+        lambda snippet, version_id, content, variable_snapshot_id=None: copied.append(
+            (snippet["id"], version_id, content, variable_snapshot_id)
+        ) or True,
+    )
+    monkeypatch.setattr(app, "_palette_make_snapshot", lambda *args: (_ for _ in ()).throw(AssertionError("不应创建快照")))
+
+    assert app._palette_fill_copy(snippet, "variables-v2", template) is True
+    assert copied == [("variables", "variables-v2", "写作 {topic}", None)]
+
+
+def test_palette_fill_copy_with_partial_values_keeps_window_for_missing_values(monkeypatch):
+    from promptbox import PromptBox
+    from promptbox_mvp.prompt_variables import PromptTemplate
+
+    app = object.__new__(PromptBox)
+    snippet = make_snippet("partial")
+    template = PromptTemplate.from_text("写作 {topic}，面向 {reader}")
+    app.palette_variable_entries = {
+        "topic": type("Entry", (), {"get": lambda self: "AI"})(),
+        "reader": type("Entry", (), {"get": lambda self: "   "})(),
+    }
+    app.palette_feedback = type("Feedback", (), {"winfo_exists": lambda self: True, "winfo_manager": lambda self: True, "config": lambda self, **kwargs: None})()
+    copied = []
+    monkeypatch.setattr(
+        app,
+        "_palette_copy_text",
+        lambda snippet, version_id, content, variable_snapshot_id=None: copied.append(
+            (snippet["id"], version_id, content, variable_snapshot_id)
+        ) or True,
+    )
+
+    assert app._palette_fill_copy(snippet, "partial-v2", template) is False
+    assert copied == []
+
+
 def test_build_quick_copy_run_has_trigger_and_nullable_rating():
     run = build_quick_copy_run("a", "a-v2", "snap_1", "2026-08-26T12:00:00+00:00", run_id="run_1")
     assert run == {

@@ -31,6 +31,8 @@ def test_folder_import_rejects_symlink_escape(tmp_path: Path):
         link.symlink_to(outside)
     except (OSError, NotImplementedError):
         pytest.skip("当前环境不支持创建符号链接")
+    if not link.is_symlink():
+        pytest.skip("当前环境未实际创建符号链接")
     (root / "manifest.json").write_text(json.dumps({"package_version": 1, "exported_at": "x", "items": []}), encoding="utf-8")
     with pytest.raises(AssetPackageError):
         analyze_import(root, [])
