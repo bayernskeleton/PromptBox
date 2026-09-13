@@ -757,9 +757,12 @@ class PromptBox:
         self._mode = "list"
         self.palette_win = None
         self.palette_selected = None
+        self.palette_selected_index = 0
         self.palette_selected_version_id = None
         self.palette_sort_mode = "recent"
         self.palette_variable_entries = {}
+        self.palette_variable_fill_mode = False
+        self.palette_versions_expanded = False
         self._last_quick_copy_signature = None
         self._last_quick_copy_at = 0.0
 
@@ -1205,7 +1208,7 @@ class PromptBox:
             f"上下文标签：{record.get('context_label') or '未记录'}",
             f"人工裁决：{record.get('verdict') or '未决定'}",
             "",
-            "用户输入：",
+            "本次材料：",
             record.get("user_input") or "（空）",
             "",
             "上下文：",
@@ -1234,6 +1237,157 @@ class PromptBox:
                 return
         self.data["repair_cases"].append(case)
         self._save_data()
+
+    def _adopt_verified_branch(self, workbench, case):
+        """Write back a reviewed branch with explicit, auditable structure semantics."""
+        branch = workbench.build_adopted_branch()
+        if not branch.get("items"):
+            raise ValueError("没有可写回的分支候选")
+        source_items = {
+            item.get("id"): item
+            for item in (workbench.ui_branch_payload or {}).get("items", [])
+            if item.get("id")
+        }
+        category_by_path = {}
+        for category in self.data.get("categories", []):
+            path = []
+            current = category
+            seen = set()
+            by_id = {item.get("id"): item for item in self.data.get("categories", [])}
+            while current and current.get("id") not in seen:
+                seen.add(current.get("id"))
+                path.append(current.get("name") or current.get("id"))
+                current = by_id.get(current.get("parent_id"))
+            category_by_path[tuple(reversed(path))] = category.get("id")
+
+        def category_id_for(item, source=None):
+            path = tuple(item.get("category_path") or [])
+            if path:
+                resolved = category_by_path.get(path)
+                if resolved is None:
+                    raise ValueError(f"分支分类路径不存在：{'/'.join(path)}")
+                return resolved
+            return (source or {}).get("category_id") or DEFAULT_CATEGORY_ID
+
+        def find_snippet(source_id):
+            return next(
+                (snippet for snippet in self.snippets
+                 if snippet.get("id") == source_id and not snippet.get("_deleted")),
+                None,
+            )
+
+        # 先校验全部来源，避免写回过程中半成功半失败。
+        branch_items = list(branch.get("items") or [])
+        for item in branch_items:
+            source_ids = list(item.get("source_ids") or [])
+            unknown = [source_id for source_id in source_ids if source_id not in source_items]
+            if unknown:
+                raise ValueError(f"分支来源 Prompt 不存在：{unknown[0]}")
+            if item.get("change_type") != "added" and not source_ids:
+                raise ValueError(f"非新增分支项缺少 source_ids：{item.get('id')}")
+
+        written_ids = []
+        consumed_sources = set()
+        writeback_entries = []
+        for item in branch_items:
+            change_type = item.get("change_type") or "modified"
+            source_ids = list(item.get("source_ids") or [])
+            if change_type == "removed":
+                for source_id in source_ids:
+                    snippet = find_snippet(source_id)
+                    if snippet is None:
+                        raise ValueError(f"分支来源 Prompt 不存在：{source_id}")
+                    snippet["_deleted"] = True
+                    snippet["updated_at"] = now()
+                    consumed_sources.add(source_id)
+                    writeback_entries.append({
+                        "candidate_id": item.get("id"), "source_ids": [source_id],
+                        "change_type": "removed", "action": "marked_deleted",
+                    })
+                continue
+
+            source_id = source_ids[0] if source_ids else None
+            source = source_items.get(source_id) if source_id else None
+            # 一个来源只能复用一次；同一来源的第二个输出项是 split，必须创建新资产。
+            reusable_source = source_id and source_id not in consumed_sources
+            snippet = find_snippet(source_id) if reusable_source else None
+            if snippet is None:
+                title = item.get("title") or "新增分支 Prompt"
+                sid = make_id("snip", title)
+                existing_ids = {entry.get("id") for entry in self.snippets}
+                original_sid = sid
+                suffix = 2
+                while sid in existing_ids:
+                    sid = f"{original_sid}_{suffix}"
+                    suffix += 1
+                version_id = make_version_id()
+                category_id = category_id_for(item, source)
+                timestamp = now()
+                self.snippets.append({
+                    "id": sid, "title": title, "category_id": category_id, "tag_ids": [],
+                    "created_at": timestamp, "updated_at": timestamp,
+                    "source_prompt_id": source_id, "source_version_id": source.get("id") if source else None,
+                    "scenario": "", "_deleted": False, "current_version_id": version_id,
+                    "stable_version_id": None, "content": "", "context": "",
+                    "variable_definitions": {}, "snapshots": [],
+                    "versions": [{
+                        "id": version_id, "version_number": 1, "content": item.get("content", ""),
+                        "changelog": "分支重构新增", "status": VER_DRAFT, "created_at": timestamp,
+                        "parent_version_id": None, "repair_case_id": case.get("id"),
+                    }],
+                })
+                written_ids.append(sid)
+                if source_id:
+                    consumed_sources.add(source_id)
+                writeback_entries.append({
+                    "candidate_id": item.get("id"), "source_ids": source_ids,
+                    "change_type": change_type, "action": "created", "snippet_ids": [sid],
+                })
+                continue
+
+            category_id = category_id_for(item, source)
+            if change_type == "unchanged":
+                written_ids.append(snippet["id"])
+                consumed_sources.update(source_ids)
+                writeback_entries.append({
+                    "candidate_id": item.get("id"), "source_ids": source_ids,
+                    "change_type": change_type, "action": "kept", "snippet_ids": [snippet["id"]],
+                })
+                continue
+            new_version = self._save_new_version(
+                snippet,
+                item.get("title") or snippet.get("title", "未命名提示词"),
+                item.get("content", ""), category_id, snippet.get("tag_ids", []),
+                "分支重构：" + (item.get("change_reason") or "人工采纳"),
+            )
+            new_version["repair_case_id"] = case.get("id")
+            written_ids.append(snippet["id"])
+            consumed_sources.update(source_ids)
+            writeback_entries.append({
+                "candidate_id": item.get("id"), "source_ids": source_ids,
+                "change_type": change_type, "action": "version_created",
+                "snippet_ids": [snippet["id"]], "version_ids": [new_version["id"]],
+            })
+
+            # merged 的后续来源不再保留为独立 Prompt；split 的后续来源为空，不会进入这里。
+            if change_type == "merged":
+                for extra_source_id in source_ids[1:]:
+                    extra = find_snippet(extra_source_id)
+                    if extra is not None:
+                        extra["_deleted"] = True
+                        extra["updated_at"] = now()
+                        writeback_entries.append({
+                            "candidate_id": item.get("id"), "source_ids": [extra_source_id],
+                            "change_type": "merged", "action": "marked_deleted",
+                        })
+
+        case["branch_writeback"] = {
+            "status": "completed", "repair_case_id": case.get("id"),
+            "written_ids": list(written_ids), "entries": writeback_entries,
+            "completed_at": now(),
+        }
+        self._save_data()
+        return written_ids
 
     def _adopt_verified_repair_case(self, case):
         """Create the formal version that corresponds to a verified repair case."""
@@ -1311,6 +1465,12 @@ class PromptBox:
             adopt_candidate=self._adopt_verified_repair_case,
             save_snapshot=save_snapshot,
         )
+        # 分支候选必须经过逐条人工裁决后，才走独立的分支写回路径。
+        workbench.adopt_candidate = lambda case: (
+            self._adopt_verified_branch(workbench, case)
+            if workbench.analysis and workbench.analysis.get("branch_candidate")
+            else self._adopt_verified_repair_case(case)
+        )
         workbench.ui_baseline = {
             "snippet_id": target["id"],
             "base_version_id": base_version["id"],
@@ -1320,6 +1480,10 @@ class PromptBox:
         workbench.ui_baseline_content = base_version.get("content", "")
         workbench.ui_variable_definitions = target.get("variable_definitions", {})
         workbench.ui_context = target.get("context", "")
+        # 把内部 prompt 集合与分类树喂给工作台，供「从 PromptBox 内部选择」
+        # （单条/多选/整文件夹）作为输入材料，拼接进原提示词输入框。
+        workbench.ui_available_snippets = self.snippets
+        workbench.ui_available_categories = self.data.get("categories", [])
         return workbench
 
     def toggle_palette(self):
@@ -1330,71 +1494,59 @@ class PromptBox:
             self._open_palette()
 
     def _open_palette(self):
-        """Open compact Palette: search, choose version, fill variables, copy."""
+        """Open a compact search-first palette; the workbench stays separate."""
         self.data = load_prompt_data()
         self.snippets = self.data["snippets"]
+        self.palette_selected = None
+        self.palette_selected_index = 0
+        self.palette_selected_version_id = None
+        self.palette_variable_fill_mode = False
+        self.palette_versions_expanded = False
         win = tk.Toplevel(self.root)
         self.palette_win = win
         win.title("快速取用")
         apply_window_icon(win)
         win.configure(bg=BG)
         win.attributes("-topmost", True)
-        width, height = 680, 650
+        width, height = 520, 420
         sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
         win.geometry(f"{width}x{height}+{(sw-width)//2}+{(sh-height)//2}")
         win.protocol("WM_DELETE_WINDOW", self._close_palette)
         win.bind("<Escape>", lambda _event: self._close_palette())
+        win.bind("<Right>", lambda _event: self._palette_show_versions())
+        win.bind("<Tab>", lambda _event: self._palette_start_variable_fill())
 
-        header = tk.Frame(win, bg=BG)
-        header.pack(fill="x", padx=16, pady=(14, 8))
-        tk.Label(header, text="快速取用", bg=BG, fg=ACCENT,
-                 font=(FONT, 16, "bold")).pack(side="left")
-        tk.Label(header, text="当前版本优先 · 复制后自动收起", bg=BG, fg=FG_DIM,
-                 font=(FONT, 10)).pack(side="left", padx=(12, 0))
-        self._btn(header, "最近调用", lambda: self._palette_set_sort("recent"),
-                  BG, FG_DIM, 9).pack(side="right", padx=2)
-        self._btn(header, "收藏优先", lambda: self._palette_set_sort("favorite"),
-                  BG, FG_DIM, 9).pack(side="right", padx=2)
-        self._btn(header, "设置", self._show_hotkey_settings,
-                  BG, FG_DIM, 9).pack(side="right", padx=2)
-
-        search_label = tk.Label(win, text="搜索提示词（标题、标签、分类、正文）", bg=BG, fg=FG_DIM,
-                                font=(FONT, 9), anchor="w")
-        search_label.pack(fill="x", padx=16)
         search_var = tk.StringVar()
         search_entry = tk.Entry(
             win, textvariable=search_var, bg=BG_INPUT, fg=FG, insertbackground=FG,
             relief="flat", font=(FONT, 13), bd=0, highlightthickness=0,
             selectbackground=ACCENT, selectforeground=BG,
         )
-        search_entry.pack(fill="x", padx=16, ipady=8, pady=(2, 8))
+        search_entry.pack(fill="x", padx=12, pady=12, ipady=7)
         self.palette_search_var = search_var
+        self.palette_search_entry = search_entry
 
         list_frame = tk.Frame(win, bg=BG)
-        list_frame.pack(fill="both", expand=True, padx=16)
+        list_frame.pack(fill="both", expand=True, padx=12, pady=(0, 6))
         canvas = tk.Canvas(list_frame, bg=BG, highlightthickness=0)
         scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=canvas.yview)
-        cards = tk.Frame(canvas, bg=BG)
-        cards.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=cards, anchor="nw", width=628)
+        rows = tk.Frame(canvas, bg=BG)
+        rows.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=rows, anchor="nw", width=496)
         canvas.configure(yscrollcommand=scrollbar.set)
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
-        self.palette_cards = cards
+        self.palette_cards = rows
         self.palette_canvas = canvas
 
         self.palette_detail = tk.Frame(win, bg=BG_PANEL)
-        self.palette_detail.pack(fill="x", padx=16, pady=(8, 0))
         self.palette_feedback = tk.Label(win, text="", bg=BG, fg=ACCENT_2, font=(FONT, 9))
-        self.palette_feedback.pack(fill="x", padx=16, pady=(3, 0))
-        footer = tk.Frame(win, bg=BG)
-        footer.pack(fill="x", padx=16, pady=(5, 12))
-        tk.Label(footer, text="Enter 复制 · Esc 收起 · 不自动粘贴", bg=BG, fg=FG_DIM,
-                 font=(FONT, 9)).pack(side="left")
-        self._btn(footer, "打开完整工作台", self._open_full_from_palette,
-                  BTN_SECONDARY, BTN_SECONDARY_FG, 10).pack(side="right")
 
         search_var.trace_add("write", lambda *_args: self._render_palette_results(search_var.get()))
+        search_entry.bind("<Up>", lambda _event: self._palette_move_selection(-1))
+        search_entry.bind("<Down>", lambda _event: self._palette_move_selection(1))
+        search_entry.bind("<Right>", lambda _event: self._palette_show_versions())
+        search_entry.bind("<Tab>", lambda _event: self._palette_start_variable_fill())
         search_entry.bind("<Return>", lambda _event: self._palette_copy_selected())
         search_entry.focus_set()
         self._render_palette_results("")
@@ -1404,8 +1556,11 @@ class PromptBox:
             self.palette_win.destroy()
         self.palette_win = None
         self.palette_selected = None
+        self.palette_selected_index = 0
         self.palette_selected_version_id = None
         self.palette_variable_entries = {}
+        self.palette_variable_fill_mode = False
+        self.palette_versions_expanded = False
 
     def _palette_set_sort(self, mode):
         self.palette_sort_mode = mode
@@ -1417,88 +1572,162 @@ class PromptBox:
         for child in self.palette_cards.winfo_children():
             child.destroy()
         self.palette_results = self._quick_copy_search(query, self.palette_sort_mode)
-        if not self.palette_results:
-            tk.Label(self.palette_cards, text="没有匹配的提示词", bg=BG, fg=FG_DIM,
-                     font=(FONT, 11)).pack(anchor="w", pady=18)
+        if self.palette_results:
+            self.palette_selected_index = min(self.palette_selected_index, len(self.palette_results) - 1)
+            selected = self.palette_results[self.palette_selected_index]
+            if not self.palette_selected or self.palette_selected.get("id") != selected.get("id"):
+                self.palette_selected = selected
+                self.palette_selected_version_id = selected.get("current_version_id")
+                self.palette_versions_expanded = False
+                self.palette_variable_fill_mode = False
+                self.palette_variable_entries = {}
+            for index, snippet in enumerate(self.palette_results):
+                self._render_palette_row(snippet, index)
         else:
-            for snippet in self.palette_results:
-                self._render_palette_card(snippet)
-        self._render_palette_detail()
+            self.palette_selected_index = 0
+            self.palette_selected = None
+            self.palette_selected_version_id = None
+            self.palette_versions_expanded = False
+            self.palette_variable_fill_mode = False
+            self.palette_variable_entries = {}
+            tk.Label(self.palette_cards, text="没有匹配的提示词", bg=BG, fg=FG_DIM,
+                     font=(FONT, 10)).pack(anchor="w", pady=18)
+        if self.palette_versions_expanded or self.palette_variable_fill_mode:
+            self._render_palette_detail()
+        elif self.palette_detail.winfo_manager():
+            self.palette_detail.pack_forget()
 
-    def _render_palette_card(self, snippet):
-        selected = self.palette_selected and self.palette_selected.get("id") == snippet.get("id")
-        card_bg = BG_PANEL if selected else BG_INPUT
-        card = tk.Frame(self.palette_cards, bg=card_bg, bd=1, relief="solid",
-                        highlightbackground=BORDER, highlightthickness=1)
-        card.pack(fill="x", pady=(0, 7))
-        header = tk.Frame(card, bg=card_bg)
-        header.pack(fill="x", padx=10, pady=(7, 2))
-        title = str(snippet.get("title", "未命名提示词"))
-        title_text = ("★ " if snippet.get("is_favorite") else "") + title[:34]
-        tk.Label(header, text=title_text, bg=card_bg, fg=ACCENT,
-                 font=(FONT, 11, "bold"), anchor="w").pack(side="left")
+    def _render_palette_row(self, snippet, index):
+        selected = index == self.palette_selected_index
+        row_bg = BG_PANEL if selected else BG_INPUT
+        row = tk.Frame(self.palette_cards, bg=row_bg, bd=0,
+                       highlightbackground=BORDER, highlightthickness=1, cursor="hand2")
+        row.pack(fill="x", pady=(0, 2))
         current = get_selected_version(snippet)
         version_text = f"v{current.get('version_number', '?')}" if current else "无版本"
-        if snippet.get("stable_version_id") == snippet.get("current_version_id"):
-            version_text += " · 稳定"
-        tk.Label(header, text=version_text, bg=card_bg, fg=FG_DIM,
-                 font=(FONT, 9)).pack(side="right")
-        category = snippet.get("_quick_copy_category_name", "")
-        tags = " ".join(f"#{name}" for name in snippet.get("_quick_copy_tag_names", []))
-        meta = " · ".join(value for value in [category, tags] if value)
-        tk.Label(card, text=meta or "未分类", bg=card_bg, fg=FG_DIM,
-                 font=(FONT, 9), anchor="w").pack(fill="x", padx=10)
-        preview = version_content(snippet).replace("\n", " ")
-        tk.Label(card, text=preview[:100] + ("..." if len(preview) > 100 else ""),
-                 bg=card_bg, fg=FG, font=(FONT, 10), anchor="w", justify="left").pack(fill="x", padx=10, pady=(2, 7))
-        for widget in (card, header):
-            widget.bind("<Button-1>", lambda _event, item=snippet: self._select_palette_item(item))
+        title = str(snippet.get("title", "未命名提示词")).strip() or "未命名提示词"
+        category = snippet.get("_quick_copy_category_name", "") or "未分类"
+        tags = " · ".join(snippet.get("_quick_copy_tag_names", [])[:2])
+        meta = " · ".join(value for value in (category, tags) if value)
+        title_label = tk.Label(row, text=title, bg=row_bg, fg=FG,
+                               font=(FONT, 10, "bold"), anchor="w")
+        title_label.pack(side="left", padx=(10, 4), pady=(6, 0))
+        version_label = tk.Label(row, text=version_text, bg=row_bg, fg=FG_DIM,
+                                 font=(FONT, 9), cursor="hand2")
+        version_label.pack(side="right", padx=10, pady=(6, 0))
+        meta_label = tk.Label(row, text=meta, bg=row_bg, fg=FG_DIM,
+                              font=(FONT, 8), anchor="w")
+        meta_label.pack(fill="x", padx=10, pady=(0, 6))
+        for widget in (row, title_label, meta_label):
+            widget.bind("<Button-1>", lambda _event, item=snippet, item_index=index: self._select_palette_item(item, item_index))
+        version_label.bind("<Button-1>", lambda _event, item=snippet, item_index=index: self._palette_show_versions_for_item(item, item_index))
 
-    def _select_palette_item(self, snippet):
+    def _palette_show_versions_for_item(self, snippet, index=None):
         self.palette_selected = snippet
+        self.palette_selected_index = index if index is not None else self.palette_selected_index
         self.palette_selected_version_id = snippet.get("current_version_id")
+        self.palette_variable_fill_mode = False
+        self.palette_versions_expanded = not self.palette_versions_expanded
         self._render_palette_results(self.palette_search_var.get())
+        return "break"
+
+    def _select_palette_item(self, snippet, index=None):
+        self.palette_selected = snippet
+        self.palette_selected_index = index if index is not None else self.palette_selected_index
+        self.palette_selected_version_id = snippet.get("current_version_id")
+        self.palette_versions_expanded = False
+        self.palette_variable_fill_mode = False
+        self.palette_variable_entries = {}
+        self._render_palette_results(self.palette_search_var.get())
+
+    def _palette_move_selection(self, delta):
+        if not getattr(self, "palette_results", None):
+            return "break"
+        self.palette_selected_index = (self.palette_selected_index + delta) % len(self.palette_results)
+        self.palette_selected = self.palette_results[self.palette_selected_index]
+        self.palette_selected_version_id = self.palette_selected.get("current_version_id")
+        self.palette_versions_expanded = False
+        self.palette_variable_fill_mode = False
+        self.palette_variable_entries = {}
+        self._render_palette_results(self.palette_search_var.get())
+        return "break"
+
+    def _palette_select_index(self, index):
+        if not getattr(self, "palette_results", None):
+            return "break"
+        self.palette_selected_index = max(0, min(index, len(self.palette_results) - 1))
+        self.palette_selected = self.palette_results[self.palette_selected_index]
+        self.palette_selected_version_id = self.palette_selected.get("current_version_id")
+        self._render_palette_results(self.palette_search_var.get())
+        return "break"
+
+    def _palette_show_versions(self):
+        if not getattr(self, "palette_results", None):
+            return "break"
+        if not self.palette_selected:
+            self.palette_selected = self.palette_results[self.palette_selected_index]
+            self.palette_selected_version_id = self.palette_selected.get("current_version_id")
+        self.palette_versions_expanded = not self.palette_versions_expanded
+        self._render_palette_results(self.palette_search_var.get())
+        return "break"
+
+    def _palette_start_variable_fill(self):
+        if not getattr(self, "palette_results", None):
+            return "break"
+        if not self.palette_selected:
+            self.palette_selected = self.palette_results[self.palette_selected_index]
+            self.palette_selected_version_id = self.palette_selected.get("current_version_id")
+        content = get_prompt_version_content(self.palette_selected, self.palette_selected_version_id)
+        template = PromptTemplate.from_text(content, self.palette_selected.get("variable_definitions", {}))
+        if not template.variables:
+            self._palette_show_feedback("这条 Prompt 没有变量")
+            return "break"
+        self.palette_variable_fill_mode = True
+        self._render_palette_results(self.palette_search_var.get())
+        self.palette_detail.after_idle(self._focus_first_palette_variable)
+        return "break"
+
+    def _focus_first_palette_variable(self):
+        if self.palette_variable_entries:
+            next(iter(self.palette_variable_entries.values())).focus_set()
 
     def _render_palette_detail(self):
         if not getattr(self, "palette_detail", None) or not self.palette_detail.winfo_exists():
             return
         for child in self.palette_detail.winfo_children():
             child.destroy()
-        snippet = self.palette_selected
-        if not snippet:
-            tk.Label(self.palette_detail, text="选择一条提示词查看版本和变量", bg=BG_PANEL, fg=FG_DIM,
-                     font=(FONT, 9)).pack(anchor="w", padx=10, pady=7)
+        if not self.palette_selected:
+            self.palette_detail.pack_forget()
             return
+        if not self.palette_detail.winfo_manager():
+            self.palette_detail.pack(fill="x", padx=12, pady=(0, 6))
+        snippet = self.palette_selected
         version_id = self.palette_selected_version_id or snippet.get("current_version_id")
         version = get_selected_version(snippet, version_id)
-        current = get_selected_version(snippet)
-        header = tk.Frame(self.palette_detail, bg=BG_PANEL)
-        header.pack(fill="x", padx=10, pady=(7, 2))
-        tk.Label(header, text=f"已选：{snippet.get('title', '未命名提示词')}", bg=BG_PANEL, fg=ACCENT,
-                 font=(FONT, 10, "bold")).pack(side="left")
-        favorite_text = "取消收藏" if snippet.get("is_favorite") else "收藏"
-        self._btn(header, favorite_text, lambda: self._palette_toggle_favorite(snippet),
-                  BTN_SECONDARY, BTN_SECONDARY_FG, 9).pack(side="right")
-        if current:
-            self._btn(header, f"当前 v{current.get('version_number', '?')}",
-                      lambda: self._palette_choose_version(snippet, current.get("id")),
-                      ACCENT_2, BG, 9).pack(side="right", padx=2)
-        tk.Label(self.palette_detail, text="历史版本", bg=BG_PANEL, fg=FG_DIM,
-                 font=(FONT, 9), anchor="w").pack(fill="x", padx=10)
-        history = sorted(snippet.get("versions", []), key=lambda item: item.get("version_number", 0), reverse=True)
-        history_row = tk.Frame(self.palette_detail, bg=BG_PANEL)
-        history_row.pack(fill="x", padx=10, pady=(2, 4))
-        for item in history[:6]:
-            label = f"v{item.get('version_number', '?')}" + (" · 当前" if item.get("id") == snippet.get("current_version_id") else "")
-            self._btn(history_row, label, lambda item_id=item.get("id"): self._palette_choose_version(snippet, item_id),
-                      ACCENT if item.get("id") == version_id else BTN_SECONDARY,
-                      BG if item.get("id") == version_id else BTN_SECONDARY_FG, 9).pack(side="left", padx=(0, 3))
         content = version.get("content", "") if version else ""
+        if self.palette_versions_expanded:
+            version_header = tk.Frame(self.palette_detail, bg=BG_PANEL)
+            version_header.pack(fill="x", padx=10, pady=(6, 2))
+            tk.Label(version_header, text="版本", bg=BG_PANEL, fg=FG_DIM,
+                     font=(FONT, 9, "bold"), anchor="w").pack(side="left")
+            version_row = tk.Frame(self.palette_detail, bg=BG_PANEL)
+            version_row.pack(fill="x", padx=10, pady=(0, 5))
+            history = sorted(snippet.get("versions", []),
+                             key=lambda item: item.get("version_number", 0), reverse=True)
+            for item in history[:6]:
+                item_id = item.get("id")
+                label = f"v{item.get('version_number', '?')}"
+                self._btn(version_row, label,
+                          lambda selected_id=item_id: self._palette_choose_version(snippet, selected_id),
+                          ACCENT if item_id == version_id else BTN_SECONDARY,
+                          BG if item_id == version_id else BTN_SECONDARY_FG, 9).pack(side="left", padx=(0, 3))
         template = PromptTemplate.from_text(content, snippet.get("variable_definitions", {}))
         self.palette_variable_entries = {}
-        if template.variables:
-            tk.Label(self.palette_detail, text="填写变量（可选）", bg=BG_PANEL, fg=WARN,
-                     font=(FONT, 9, "bold"), anchor="w").pack(fill="x", padx=10, pady=(1, 2))
+        if self.palette_variable_fill_mode and template.variables:
+            variable_header = tk.Frame(self.palette_detail, bg=BG_PANEL)
+            variable_header.pack(fill="x", padx=10, pady=(3, 2))
+            tk.Label(variable_header, text="变量", bg=BG_PANEL, fg=WARN,
+                     font=(FONT, 9, "bold"), anchor="w").pack(side="left")
             for variable in template.variables:
                 row = tk.Frame(self.palette_detail, bg=BG_PANEL)
                 row.pack(fill="x", padx=10, pady=1)
@@ -1507,15 +1736,15 @@ class PromptBox:
                 entry = tk.Entry(row, bg=BG_INPUT, fg=FG, insertbackground=FG, relief="flat",
                                  font=(FONT, 9), bd=0, highlightthickness=0)
                 entry.pack(side="left", fill="x", expand=True, ipady=3)
-                if variable.get("example"):
-                    entry.insert(0, variable["example"])
+                entry.bind("<Return>", lambda _event: self._palette_copy_selected())
                 self.palette_variable_entries[variable["name"]] = entry
-        buttons = tk.Frame(self.palette_detail, bg=BG_PANEL)
-        buttons.pack(fill="x", padx=10, pady=(4, 8))
-        self._btn(buttons, "复制原文", lambda: self._palette_copy_text(snippet, version_id, content),
-                  BTN_SECONDARY, BTN_SECONDARY_FG, 9).pack(side="right", padx=2)
-        if template.variables:
-            self._btn(buttons, "填充并复制", lambda: self._palette_fill_copy(snippet, version_id, template),
+            buttons = tk.Frame(self.palette_detail, bg=BG_PANEL)
+            buttons.pack(fill="x", padx=10, pady=(4, 7))
+            self._btn(buttons, "复制原文",
+                      lambda: self._palette_copy_text(snippet, version_id, content),
+                      BTN_SECONDARY, BTN_SECONDARY_FG, 9).pack(side="right", padx=2)
+            self._btn(buttons, "填充并复制",
+                      lambda: self._palette_fill_copy(snippet, version_id, template),
                       ACCENT, BG, 9, True).pack(side="right", padx=2)
 
     def _palette_choose_version(self, snippet, version_id):
@@ -1541,36 +1770,49 @@ class PromptBox:
         self._save_data()
         return snapshot
 
+    def _palette_show_feedback(self, text):
+        if not getattr(self, "palette_feedback", None) or not self.palette_feedback.winfo_exists():
+            return
+        if not self.palette_feedback.winfo_manager():
+            self.palette_feedback.pack(fill="x", padx=12, pady=(0, 2))
+        self.palette_feedback.config(text=text)
+
     def _palette_copy_text(self, snippet, version_id, content, variable_snapshot_id=None):
         if not content or not copy_to_clipboard(content):
-            self.palette_feedback.config(text="复制失败，未记录调用")
+            self._palette_show_feedback("复制失败")
             return False
         self._record_quick_copy(snippet.get("id", ""), version_id, variable_snapshot_id)
-        self.palette_feedback.config(text="复制成功 · 已记录本次调用")
+        self._palette_show_feedback("已复制")
         self.palette_win.after(450, self._close_palette)
         return True
 
     def _palette_fill_copy(self, snippet, version_id, template):
+        values = {name: entry.get().strip() for name, entry in self.palette_variable_entries.items()}
+        if not any(values.values()):
+            return self._palette_copy_text(snippet, version_id, template.text)
         try:
-            values = {name: entry.get() for name, entry in self.palette_variable_entries.items()}
             rendered = template.render(values)
         except ValueError as exc:
-            self.palette_feedback.config(text=str(exc))
+            self._palette_show_feedback(str(exc))
             return False
         try:
             snapshot = self._palette_make_snapshot(snippet, version_id, template, rendered)
         except (ValueError, OSError) as exc:
-            self.palette_feedback.config(text=f"变量快照保存失败：{exc}")
+            self._palette_show_feedback(f"变量快照保存失败：{exc}")
             return False
         return self._palette_copy_text(snippet, version_id, rendered, snapshot.get("id"))
 
     def _palette_copy_selected(self):
-        snippet = self.palette_selected
-        if not snippet and getattr(self, "palette_results", None):
-            snippet = self.palette_results[0]
-        if not snippet:
-            return False
+        if not getattr(self, "palette_results", None):
+            return "break"
+        snippet = self.palette_selected or self.palette_results[self.palette_selected_index]
+        self.palette_selected = snippet
         version_id = self.palette_selected_version_id or snippet.get("current_version_id")
+        if self.palette_variable_fill_mode:
+            content = get_prompt_version_content(snippet, version_id)
+            template = PromptTemplate.from_text(content, snippet.get("variable_definitions", {}))
+            if template.variables:
+                return self._palette_fill_copy(snippet, version_id, template)
         return self._palette_copy_text(snippet, version_id, get_prompt_version_content(snippet, version_id))
 
     def _open_full_from_palette(self):
@@ -2959,7 +3201,7 @@ class PromptBox:
         render_tag_panel()
 
         # ── 业务上下文（可选）：写 Prompt 时即可注入，不必等"失灵"才进工作台 ──
-        ctx_frame = tk.LabelFrame(dlg, text="业务上下文（可选，随提示词保存）", bg=BG, fg=FG_DIM,
+        ctx_frame = tk.LabelFrame(dlg, text="业务背景（可选，随提示词保存）", bg=BG, fg=FG_DIM,
                                   font=(FONT, 10, "bold"), bd=0, highlightthickness=1,
                                   highlightbackground=BORDER)
         ctx_frame.pack(fill="x", padx=18, pady=(4, 0))
@@ -2993,25 +3235,25 @@ class PromptBox:
                 from promptbox_mvp.context_loader import load_context_file
                 loaded = load_context_file(path)
             except ValueError as exc:
-                messagebox.showerror("业务上下文", str(exc), parent=dlg)
+                messagebox.showerror("业务背景", str(exc), parent=dlg)
                 return
             ctx_text.delete("1.0", tk.END)
             ctx_text.insert("1.0", loaded["text"])
             if loaded["note"]:
-                messagebox.showinfo("业务上下文", loaded["note"], parent=dlg)
+                messagebox.showinfo("业务背景", loaded["note"], parent=dlg)
             refresh_ctx_info()
 
         def ctx_load_clipboard():
             if pyperclip is None:
-                messagebox.showerror("业务上下文", "未安装 pyperclip，无法读取剪贴板。", parent=dlg)
+                messagebox.showerror("业务背景", "未安装 pyperclip，无法读取剪贴板。", parent=dlg)
                 return
             try:
                 content = pyperclip.paste()
             except Exception as exc:
-                messagebox.showerror("业务上下文", f"读取剪贴板失败：{exc}", parent=dlg)
+                messagebox.showerror("业务背景", f"读取剪贴板失败：{exc}", parent=dlg)
                 return
             if not content.strip():
-                messagebox.showinfo("业务上下文", "剪贴板是空的。", parent=dlg)
+                messagebox.showinfo("业务背景", "剪贴板是空的。", parent=dlg)
                 return
             ctx_text.delete("1.0", tk.END)
             ctx_text.insert("1.0", content)
@@ -3121,6 +3363,7 @@ class PromptBox:
             dialog = tk.Toplevel(dlg)
             dialog.title("插入表格")
             dialog.configure(bg=BG)
+            apply_window_icon(dialog)
             dialog.transient(dlg)
             dialog.grab_set()
             rows_var = tk.StringVar(value="3")
@@ -3819,7 +4062,7 @@ class PromptBox:
                 f"上下文：原始 {run.get('source_chars', '未记录')} 字符；实际发送 {run.get('context_chars', '未记录')} 字符；截断：{'是' if run.get('truncated') else '否'}",
                 f"上下文哈希：{run.get('context_hash') or '未记录'}",
                 f"上下文标签：{run.get('context_label') or '未记录'}",
-                "[任务输入]",
+                "[本次材料]",
                 run.get('user_input') or "（空）",
                 "[上下文快照]",
                 run.get('context_text') or "（历史记录未保存）",
@@ -4033,6 +4276,8 @@ class Win32HotkeyManager:
         self.thread = None
         self.running = False
         self.registered = False
+        self._startup_event = threading.Event()
+        self._start_result = False
 
     @staticmethod
     def _key_parts(hotkey):
@@ -4061,28 +4306,20 @@ class Win32HotkeyManager:
         return flags, key_map[main_key]
 
     def start(self):
-        import ctypes
-        user32 = ctypes.windll.user32
-        modifiers, virtual_key = self._key_parts(self.hotkey)
-        res = user32.RegisterHotKey(0, self.HOTKEY_ID, modifiers, virtual_key)
-        if not res:
-            err = ctypes.get_last_error()
-            print(f"[Win32Hotkey] 注册热键失败，错误码: {err}，可能已被其他软件独占。", flush=True)
-            self.registered = False
-            return False
-        self.registered = True
-        print(f"[Win32Hotkey] 全局热键 {self.hotkey} 注册成功", flush=True)
-
+        """Start a dedicated listener thread that owns both registration and message loop."""
         self.running = True
-        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self._startup_event.clear()
+        self._start_result = False
+        self.thread = threading.Thread(target=self._loop, daemon=True, name="PromptBoxHotkey")
         self.thread.start()
-        return True
+        self._startup_event.wait(timeout=2)
+        return self._start_result
 
     def stop(self):
         self.running = False
         import ctypes
         user32 = ctypes.windll.user32
-        # 发送空消息解除 GetMessage 阻塞
+        # Send a null message to unblock GetMessage on the listener thread.
         if self.thread and self.thread.ident:
             user32.PostThreadMessageW(self.thread.ident, 0x0000, 0, 0)
 
@@ -4094,6 +4331,22 @@ class Win32HotkeyManager:
         HOTKEY_ID = self.HOTKEY_ID
         msg = wintypes.MSG()
         try:
+            # Force creation of this thread's Windows message queue before registration.
+            user32.PeekMessageW(ctypes.byref(msg), 0, 0, 0, 0)
+            modifiers, virtual_key = self._key_parts(self.hotkey)
+            res = user32.RegisterHotKey(0, HOTKEY_ID, modifiers, virtual_key)
+            if not res:
+                err = ctypes.get_last_error()
+                print(f"[Win32Hotkey] 注册热键失败，错误码: {err}，可能已被其他软件独占。", flush=True)
+                self.registered = False
+                self._start_result = False
+                self._startup_event.set()
+                return
+            self.registered = True
+            self._start_result = True
+            self._startup_event.set()
+            print(f"[Win32Hotkey] 全局热键 {self.hotkey} 注册成功", flush=True)
+
             while self.running:
                 r = user32.GetMessageW(ctypes.byref(msg), 0, 0, 0)
                 if r <= 0 or not self.running:
@@ -4103,8 +4356,13 @@ class Win32HotkeyManager:
                         self.callback()
                 user32.TranslateMessage(ctypes.byref(msg))
                 user32.DispatchMessageW(ctypes.byref(msg))
+        except Exception:
+            self._start_result = False
+            self._startup_event.set()
+            raise
         finally:
-            user32.UnregisterHotKey(0, HOTKEY_ID)
+            if self.registered:
+                user32.UnregisterHotKey(0, HOTKEY_ID)
             self.registered = False
             print("[Win32Hotkey] 热键已注销", flush=True)
 

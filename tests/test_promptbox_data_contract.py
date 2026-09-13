@@ -10,6 +10,7 @@ from promptbox_mvp.contract import (
     record_verdict,
     record_verification,
     record_pairwise_verification,
+    _validate_case,
 )
 
 
@@ -254,6 +255,16 @@ def test_contract_validation_rejects_malformed_verification():
 
     with pytest.raises(ValueError):
         create_candidate(case, "candidate", [])
+
+
+def test_branch_repair_case_allows_audited_writeback_fields():
+    case = create_repair_case("snip_1", "ver_1", 1, "原", "坏", "输入")
+    case["branch_decisions"] = {"c1": "adopt"}
+    case["branch_writeback"] = {
+        "status": "completed", "repair_case_id": case["id"],
+        "written_ids": ["snip_1"], "entries": [], "completed_at": "2026-08-31T00:00:00Z",
+    }
+    assert _validate_case(case) is None
 
 
 def test_record_pairwise_verification_stores_pairwise_runs_and_verdicts():

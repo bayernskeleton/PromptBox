@@ -1,6 +1,7 @@
 """Canonical PromptBox launcher kept in the product directory."""
 import importlib.util
 import os
+import shutil
 import subprocess
 import sys
 import traceback
@@ -41,22 +42,24 @@ def desktop_path() -> Path:
     return Path.home() / "Desktop"
 
 
-def create_desktop_shortcut() -> bool:
-    """Create the user-facing shortcut once when running as a bundled EXE."""
-    if not getattr(sys, "frozen", False) or sys.platform != "win32":
-        return False
-    shortcut = desktop_path() / "PromptBox.lnk"
-    if shortcut.exists():
-        return False
-    target = Path(sys.executable).resolve()
+def startup_folder_path() -> Path:
+    """Return the current user's Startup folder without hard-coding a username."""
+    configured = os.environ.get("USERPROFILE")
+    profile = Path(configured) if configured else Path.home()
+    return profile / "AppData" / "Roaming" / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+
+
+def _create_shortcut(shortcut: Path, target: Path) -> bool:
+    """Create or refresh a Windows shell shortcut without showing a console."""
     shortcut.parent.mkdir(parents=True, exist_ok=True)
     escaped_target = str(target).replace("'", "''")
     escaped_shortcut = str(shortcut).replace("'", "''")
+    escaped_working_directory = str(target.parent).replace("'", "''")
     script = (
         "$w=New-Object -ComObject WScript.Shell;"
         f"$s=$w.CreateShortcut('{escaped_shortcut}');"
         f"$s.TargetPath='{escaped_target}';"
-        f"$s.WorkingDirectory='{str(target.parent).replace(chr(39), chr(39) * 2)}';"
+        f"$s.WorkingDirectory='{escaped_working_directory}';"
         f"$s.IconLocation='{escaped_target},0';"
         "$s.Save()"
     )
@@ -68,10 +71,90 @@ def create_desktop_shortcut() -> bool:
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (OSError, subprocess.CalledProcessError):
-        log("[launcher] shortcut creation failed")
+        log(f"[launcher] shortcut creation failed: {shortcut}")
         log(traceback.format_exc())
         return False
     return True
+
+
+def create_desktop_shortcut() -> bool:
+    """Create or refresh the user-facing shortcut for a bundled EXE."""
+    if not getattr(sys, "frozen", False) or sys.platform != "win32":
+        return False
+    target = Path(sys.executable).resolve()
+    return _create_shortcut(desktop_path() / "PromptBox.lnk", target)
+
+
+def create_startup_shortcut() -> bool:
+    """Create or refresh current-user login startup for a bundled EXE."""
+    if not getattr(sys, "frozen", False) or sys.platform != "win32":
+        return False
+    target = Path(sys.executable).resolve()
+    return _create_shortcut(startup_folder_path() / "PromptBox.lnk", target)
+
+
+def _runtime_supports_promptbox(executable: Path) -> bool:
+    """Check that a Python executable can import PromptBox's GUI/runtime dependencies."""
+    probe = "import tkinter, keyboard, pyperclip, PIL"
+    try:
+        result = subprocess.run(
+            [str(executable), "-c", probe],
+            check=False,
+            capture_output=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except OSError:
+        return False
+    return result.returncode == 0
+
+
+def _candidate_python_runtimes() -> list[Path]:
+    """Return local Python candidates, preferring the current runtime."""
+    candidates = [Path(sys.executable)]
+    if os.name == "nt":
+        candidates.extend(
+            Path(path) for path in (
+                os.environ.get("PROMPTBOX_PYTHON", ""),
+                r"C:\Program Files\Python310\python.exe",
+            ) if path
+        )
+        for command in ("python.exe", "py.exe"):
+            found = shutil.which(command)
+            if found:
+                candidates.append(Path(found))
+    unique = []
+    seen = set()
+    for candidate in candidates:
+        resolved = candidate.expanduser().resolve()
+        if resolved not in seen and resolved.exists():
+            unique.append(resolved)
+            seen.add(resolved)
+    return unique
+
+
+def find_usable_runtime(candidates=None) -> Path | None:
+    """Find a Python runtime that can actually import PromptBox dependencies."""
+    for candidate in candidates or _candidate_python_runtimes():
+        if _runtime_supports_promptbox(Path(candidate)):
+            return Path(candidate).resolve()
+    return None
+
+
+def _run_source_with_usable_runtime(runtime: Path) -> None:
+    """Re-exec the canonical launcher with a GUI-capable Python runtime."""
+    executable = runtime
+    if os.name == "nt" and runtime.name.lower() == "python.exe":
+        windowless = runtime.with_name("pythonw.exe")
+        if windowless.exists():
+            executable = windowless
+    env = os.environ.copy()
+    env["PROMPTBOX_LAUNCHER_REEXEC"] = "1"
+    subprocess.run(
+        [str(executable), str(Path(__file__).resolve())],
+        check=True,
+        cwd=str(resolve_base_dir()),
+        env=env,
+    )
 
 
 def load_promptbox_module():
@@ -92,7 +175,19 @@ def load_promptbox_module():
 def main() -> None:
     log("[launcher] starting PromptBox")
     try:
+        if not getattr(sys, "frozen", False) and not os.environ.get("PROMPTBOX_LAUNCHER_REEXEC"):
+            runtime = find_usable_runtime()
+            current = Path(sys.executable).resolve()
+            if runtime is None:
+                raise RuntimeError(
+                    "没有找到可运行 PromptBox 的 Python 环境，请安装带 Tkinter 的 Python 并安装 requirements.txt。"
+                )
+            if runtime != current:
+                log(f"[launcher] re-exec with runtime: {runtime}")
+                _run_source_with_usable_runtime(runtime)
+                return
         create_desktop_shortcut()
+        create_startup_shortcut()
         load_promptbox_module().main()
     except Exception:
         log("[launcher] fatal exception")

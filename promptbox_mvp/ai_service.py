@@ -1,5 +1,6 @@
 import json
 import time
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable
 
@@ -93,6 +94,30 @@ def _build_quick_check(audit: dict[str, object]) -> dict[str, list[str]]:
     }
 
 
+_BRANCH_CHANGE_TYPES = {"unchanged", "modified", "merged", "split", "added", "removed"}
+
+
+def _validate_branch_candidate(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or not isinstance(value.get("items"), list) or not value["items"]:
+        raise ValueError("branch_candidate must contain non-empty items")
+    for item in value["items"]:
+        if not isinstance(item, dict):
+            raise ValueError("branch_candidate item must be an object")
+        required = ("id", "title", "category_path", "content", "source_ids", "change_type", "change_reason")
+        text_required = {"id", "title", "change_type", "change_reason"}
+        if any(not isinstance(item.get(key), str) or not item[key].strip() for key in text_required):
+            raise ValueError("branch_candidate item has invalid fields")
+        if not isinstance(item.get("content"), str):
+            raise ValueError("branch_candidate item has invalid fields")
+        if not isinstance(item.get("category_path"), list) or not all(isinstance(x, str) for x in item["category_path"]):
+            raise ValueError("branch_candidate category_path must be a string list")
+        if not isinstance(item.get("source_ids"), list) or not all(isinstance(x, str) for x in item["source_ids"]):
+            raise ValueError("branch_candidate source_ids must be a string list")
+        if item["change_type"] not in _BRANCH_CHANGE_TYPES:
+            raise ValueError("branch_candidate has invalid change_type")
+    return value
+
+
 def compose_user_payload(
     context_text: str,
     user_input: str,
@@ -137,6 +162,7 @@ class RepairService:
         task_goal: str = "",
         mode: str = "",
         context: str = "",
+        branch: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Generate an optimized candidate. Only ``prompt`` is required.
 
@@ -173,6 +199,9 @@ class RepairService:
             sections.append(f"对照输入:\n{comparison_input}")
         if task_goal.strip():
             sections.append(f"任务目标:\n{task_goal}")
+        branch_mode = isinstance(branch, dict) and branch.get("is_branch") is True and len(branch.get("items") or []) > 1
+        if branch_mode:
+            sections.append("分支结构 JSON（必须保留多条 Prompt，不得压平成一条）:\n" + json.dumps(branch, ensure_ascii=False))
         sections.extend(
             [
                 f"修复档位：{mode_hint}",
@@ -221,6 +250,12 @@ class RepairService:
             or any(not self._non_empty_string(reason) for reason in reasons)
         ):
             raise ValueError("reasons must be a non-empty list of non-empty strings")
+        branch_candidate = result.get("branch_candidate")
+        if branch_mode and mode == "A":
+            branch_candidate = _validate_branch_candidate(branch_candidate)
+        structure_diagnosis = result.get("structure_diagnosis", [])
+        if not isinstance(structure_diagnosis, list):
+            raise ValueError("structure_diagnosis must be a list")
 
         return {
             "diagnosis": diagnosis,
@@ -238,6 +273,8 @@ class RepairService:
                 code for code in result.get("unresolved_issue_codes", [])
                 if isinstance(code, str)
             ],
+            "branch_candidate": deepcopy(branch_candidate) if branch_candidate is not None else None,
+            "structure_diagnosis": deepcopy(structure_diagnosis),
         }
 
     def verify(

@@ -43,6 +43,8 @@ dist/
 dist_py310/
 build/
 build_py310/
+installer/Output/
+installer/PromptBox.generated.iss
 *.spec.bak
 *.spec.bak-*
 .exe-smoke-data/

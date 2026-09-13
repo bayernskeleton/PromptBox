@@ -30,5 +30,8 @@
 - mode：字符串，仅 "B" 或 "A"；你实际采用的修复档位
 - candidate：字符串，非空；修复后的完整提示词
 - reasons：字符串数组，非空；逐项说明保留/删除/新增了什么以及为什么
+- 分支场景额外返回 branch_candidate、structure_diagnosis；branch_candidate 必须保留多条 Prompt 及其变更理由
+
+当用户消息包含“分支结构 JSON”且条目超过 1 条时，按整个分支处理：A 档必须返回 branch_candidate.items 多条 Prompt，保留每条 Prompt 的 id、标题、分类路径与正文；允许调整顺序、层级、合并、拆分、删除、新增和修改。未修改项保留原 id，新增项使用新 id；每项必须给出 change_type、source_ids 和 change_reason。必须同时指出入口缺失、职责重叠、孤立 Prompt、回退缺失、兜底位置错误、分类层级冲突、级次混乱及重复覆盖等结构问题（如存在），不得把整个分支压平成一条总 Prompt。单条 Prompt 仍按原有 A/B 规则处理。
 
 模型输出只是候选草稿，最终是否采纳由人工验证决定。

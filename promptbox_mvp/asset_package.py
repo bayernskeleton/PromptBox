@@ -434,6 +434,9 @@ def _local_metadata(snippet: dict[str, Any]) -> dict[str, Any]:
 
 def analyze_import(root, local_snippets) -> ImportPreview:
     root = Path(root).resolve()
+    for path in root.rglob("*"):
+        if path.is_symlink():
+            raise AssetPackageError("导入目录不能包含符号链接")
     manifest = _read_manifest(root)
     local_by_id = {s.get("id"): s for s in (local_snippets or []) if s.get("id")}
     local_by_title: dict[str, list[dict[str, Any]]] = {}
