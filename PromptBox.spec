@@ -11,8 +11,9 @@ a = Analysis(
     binaries=[],
     datas=[
         ('promptbox_mvp', 'promptbox_mvp'),
-        ('snippets.default.json', '.'),
-        ('snippets.demo.json', '.'),
+        # 不打包 snippets.default.json / snippets.demo.json：
+        # 它们是旧版首启种子，现行代码只读写 ~/.promptbox/snippets.json，
+        # 且默认库含个人 Prompt，不能进入公开分发包。
         # 保持目录形式与 v1 原版一致（图标加载行为零差异）。
         # 如需进一步瘦身：把 logos/ 下 3 张 AI 原图（Minimalist_*，共 2.1M）
         # 移出 logos/ 目录，此条目自动变小。

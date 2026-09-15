@@ -30,7 +30,8 @@ snippets.demo.json
 docs/
 screenshots/
 outputs/
-packaging/
+packaging/*
+!packaging/PromptBox.lnk.instructions.md
 tools/e2e_product_verification.py
 
 # 个人工作区与历史备份（不属于产品交付）
