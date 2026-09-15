@@ -1,0 +1,75 @@
+name: Windows Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest pyinstaller
+
+      - name: Run tests
+        run: python -m pytest tests -q
+
+      - name: Build PromptBox.exe
+        run: python scripts/build_windows.py --skip-tests
+
+      - name: Locate Inno Setup
+        shell: pwsh
+        run: |
+          $candidates = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+          )
+          $iscc = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) {
+            choco install innosetup -y --no-progress
+            $iscc = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          if (-not $iscc) { throw "Inno Setup compiler ISCC.exe was not found" }
+          "ISCC=$iscc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Output "Using $iscc"
+
+      - name: Build PromptBox installer
+        shell: pwsh
+        run: |
+          $iss = "installer\PromptBox.iss"
+          $text = Get-Content $iss -Raw -Encoding UTF8
+          [System.IO.File]::WriteAllText((Resolve-Path $iss), $text, (New-Object System.Text.UTF8Encoding $true))
+          & $env:ISCC $iss
+          $setup = "installer\Output\PromptBox-Setup.exe"
+          if (-not (Test-Path $setup)) { throw "Installer was not produced: $setup" }
+          Get-Item $setup | Select-Object FullName, Length
+
+      - name: Upload installer artifact
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: PromptBox-Windows-installer
+          path: installer/Output/PromptBox-Setup.exe
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: installer/Output/PromptBox-Setup.exe
